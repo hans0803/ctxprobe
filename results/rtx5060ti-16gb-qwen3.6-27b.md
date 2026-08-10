@@ -1,0 +1,139 @@
+# RTX 5060 Ti 16GB — Qwen3.6-27B-IQ4_XS
+
+Full measurement run, 2026-08-10. This is the data the tool was built from.
+
+Reproduce the ceiling in six boots:
+
+```bash
+ctxprobe Qwen3.6-27B-IQ4_XS.gguf --min 32768 --max 36864 -- --reasoning-budget 0
+```
+
+## Hardware
+
+Everything here is decided by the card. The model runs entirely in VRAM
+(`-ngl 999`, no CPU offload), so host RAM never enters the budget.
+
+| | |
+|---|---|
+| **GPU** | **NVIDIA GeForce RTX 5060 Ti — 16311 MiB reported, 15849 MiB allocatable** |
+| Driver | 595.84 |
+| llama.cpp | `0a50d99`, CUDA build |
+| Host | i7-14700, 64 GB DDR4 — not a factor in any number below |
+
+## Model
+
+[unsloth/Qwen3.6-27B-GGUF](https://huggingface.co/unsloth/Qwen3.6-27B-GGUF) — `Qwen3.6-27B-IQ4_XS.gguf`, 15.44 GB.
+
+Qwen3.6-27B is 64 layers but only **16 are full attention** (`full_attention_interval: 4`);
+the other 48 are linear attention with fixed-size state. KV cache is therefore much
+cheaper than a conventional 27B — about **34 MiB per 1K tokens** at q8_0.
+
+Why IQ4_XS: it is the largest Q4-class quant that fits. `Q4_K_S` is 15.86 GB and
+`Q4_K_M` is 16.82 GB — both exceed the card before any KV cache exists.
+
+## Context ceiling
+
+`--parallel 1`, `--cache-type-k/v q8_0`, `-ngl 999`, `--reasoning-budget 0`.
+
+| Context | Result | Peak VRAM | Generate |
+|---|---|---|---|
+| 8,192 | PASS | 15420 MiB | 25.88 tok/s |
+| 16,384 | PASS | 15722 MiB | 25.90 tok/s |
+| 20,480 | PASS | 15435 MiB | 25.99 tok/s |
+| 24,576 | PASS | 15591 MiB | 25.97 tok/s |
+| 28,672 | PASS | 15747 MiB | 26.01 tok/s |
+| 30,720 | PASS | 15825 MiB | 26.00 tok/s |
+| 33,792 | PASS | 15797 MiB | 26.01 tok/s |
+| **34,816** | **PASS** | 15845 MiB | **25.99 tok/s** |
+| 35,072 | **LONG_OOM** | 15847 MiB | 25.98 tok/s |
+| 35,328 | FAIL | — | — |
+| 36,864 | FAIL | — | — |
+
+No prefill column here on purpose. These runs were qualified with a short
+prompt, and a short prompt reports ~98 tok/s prefill on this card versus ~900
+tok/s under a real one — an artefact of fixed overhead, not a rate. Prefill is
+only meaningful measured against prompt length, which is the next section.
+
+**34,816 is the ceiling.** 35,072 loads, decodes a short prompt at full speed,
+then CUDA-OOMs on a 30K-token prompt and leaves a defunct process behind. It is
+the single clearest argument for validating with a full-size prompt.
+
+Generation speed is flat at ~26 tok/s across the whole range — context costs
+memory, not throughput, until you hit the wall.
+
+## Prefill vs prompt length
+
+Measured against the deployed 34,816 config. Each prompt is randomly generated
+so the server's prompt cache can't skew results.
+
+| Prompt tokens | Prefill | TTFT | Generate |
+|---|---|---|---|
+| 799 | 836 tok/s | 0.96 s | 27.52 tok/s |
+| 3,230 | 970 tok/s | 3.3 s | 26.67 tok/s |
+| 12,649 | 945 tok/s | 13.4 s | 25.56 tok/s |
+| 21,577 | 905 tok/s | 23.8 s | 24.94 tok/s |
+| 25,424 | 890 tok/s | 28.6 s | 23.99 tok/s |
+| 32,508 | 860 tok/s | 37.8 s | 23.50 tok/s |
+
+Prefill holds ~860–970 tok/s with only mild decay. TTFT grows linearly and is
+the dominant cost at long context — 38 seconds before the first token at 32K.
+Generation drops ~13% from empty to full window.
+
+Short prompts are *slower* per token (836 tok/s at 799 tokens) because fixed
+overhead hasn't amortised.
+
+## What freeing VRAM bought
+
+The context ceiling moved twice without touching the model:
+
+| Change | dGPU idle usage | Ceiling |
+|---|---|---|
+| Default (`--parallel 4`), desktop on dGPU | 605 MiB | 4,096 |
+| `--parallel 1` | 605 MiB | 16,384 |
+| Display moved to iGPU | 162 MiB | 30,720 |
+| GNOME Remote Desktop moved to iGPU | **15 MiB** | **34,816** |
+
+`--parallel 1` alone was a 4× win. Moving the display to the integrated GPU
+(BIOS: `Primary Display = IGFX`, `iGPU Multi-Monitor = Enabled`) freed 443 MiB.
+
+GNOME Remote Desktop kept holding 130 MiB on the dGPU even after the display
+moved, because it loads `libcuda` + `libnvidia-encode` for NVENC. Pinning it to
+Mesa/Intel released it:
+
+```ini
+# ~/.config/systemd/user/gnome-remote-desktop.service.d/igpu.conf
+[Service]
+Environment=__EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/50_mesa.json
+Environment=__GLX_VENDOR_LIBRARY_NAME=mesa
+```
+
+Verified afterwards: the process loads only `libEGL_mesa` + `libgallium`, and
+`libcuda` no longer appears in its memory map.
+
+## VRAM behaviour during inference
+
+Sampled `nvidia-smi` every 50 ms across a full prefill + decode cycle, 481 samples:
+
+```
+min 15845 MiB, max 15845 MiB
+```
+
+**llama.cpp's VRAM usage is completely static.** All buffers are allocated at
+load time and nothing grows during inference. So a config that loads and passes
+a full-window prompt will not OOM later from inference alone — the margin only
+has to survive other processes touching the card.
+
+## Rejected: NVFP4
+
+Both NVFP4 builds of this model are far too large for 16 GB, because "NVFP4" is
+mixed precision rather than 4-bit throughout:
+
+| Build | Size | Notes |
+|---|---|---|
+| [nvidia/Qwen3.6-27B-NVFP4](https://huggingface.co/nvidia/Qwen3.6-27B-NVFP4) | 21.94 GB | attention + `linear_attn` layers are FP8 |
+| [unsloth/Qwen3.6-27B-NVFP4](https://huggingface.co/unsloth/Qwen3.6-27B-NVFP4) | 23.44 GB | same, plus the vision tower left at BF16 |
+| GGUF IQ4_XS | **15.44 GB** | ~4.25 bpw across essentially everything |
+
+Only the MLP tensors are 4-bit in either build. The hardware is capable —
+5060 Ti is Blackwell sm_120 with native FP4 — but vLLM cannot offload weights to
+CPU, so oversized means it simply doesn't start.

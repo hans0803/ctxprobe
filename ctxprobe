@@ -1,0 +1,318 @@
+#!/usr/bin/env bash
+# ctxprobe — find the largest context a GGUF actually runs at on one GPU.
+#
+# Estimators tell you a context size should fit. ctxprobe proves it runs:
+# every candidate is booted for real, given a short prompt, and then given a
+# prompt that fills most of the window — because prefill compute buffers grow
+# with prompt length, a config can load fine, decode a short prompt at full
+# speed, and still CUDA-OOM on a real one.
+#
+# Usage:
+#   ctxprobe MODEL.gguf [options] [-- extra llama-server args]
+#
+# Options:
+#   --min N           lower bound for the search (default 2048)
+#   --max N           upper bound (default: model's trained context, capped 131072)
+#   --step N          granularity (default 256 — llama.cpp pads n_ctx to 256)
+#   --kv TYPE         KV cache type: q8_0 (default), f16, q4_0, ...
+#   --parallel N      server slots (default 1; the default of 4 quadruples KV)
+#   --ngl N           layers on GPU (default 999 = all). Lower values spill to
+#                     system RAM — useful for measuring what overflow costs,
+#                     but then a PASS no longer means "ran entirely on the GPU"
+#   --list "A B C"    test these sizes instead of binary-searching
+#   --fill PCT        how full the long prompt should be, 0-100 (default 75)
+#   --port N          port for the probe server (default 6099)
+#   --out DIR         where logs go (default ./ctxprobe-out)
+#   --json            emit machine-readable JSON to stdout
+#   --keep            don't delete per-run logs
+set -uo pipefail
+
+die() { echo "ctxprobe: $*" >&2; exit 1; }
+
+MODEL=""; MIN=2048; MAX=""; STEP=256; KV="q8_0"; PARALLEL=1
+LIST=""; FILL=75; PORT=6099; OUT="./ctxprobe-out"; JSON=0; KEEP=0
+EXTRA=()
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --min) MIN="$2"; shift 2 ;;
+    --max) MAX="$2"; shift 2 ;;
+    --step) STEP="$2"; shift 2 ;;
+    --kv) KV="$2"; shift 2 ;;
+    --parallel) PARALLEL="$2"; shift 2 ;;
+    --list) LIST="$2"; shift 2 ;;
+    --fill) FILL="$2"; shift 2 ;;
+    --port) PORT="$2"; shift 2 ;;
+    --out) OUT="$2"; shift 2 ;;
+    --json) JSON=1; shift ;;
+    --keep) KEEP=1; shift ;;
+    -h|--help) sed -n '2,/^set /p' "$0" | grep '^#' | sed 's/^# \{0,1\}//'; exit 0 ;;
+    --) shift; EXTRA=("$@"); break ;;
+    -*) die "unknown option: $1" ;;
+    *) [[ -z "$MODEL" ]] && MODEL="$1" || die "unexpected argument: $1"; shift ;;
+  esac
+done
+
+[[ -n "$MODEL" ]] || die "usage: ctxprobe MODEL.gguf [options]  (--help for more)"
+[[ -f "$MODEL" ]] || die "model not found: $MODEL"
+
+LLAMA_BIN="${LLAMA_SERVER:-$(command -v llama-server || echo "$HOME/llama.cpp/build/bin/llama-server")}"
+[[ -x "$LLAMA_BIN" ]] || die "llama-server not found. Set LLAMA_SERVER=/path/to/llama-server"
+command -v nvidia-smi >/dev/null || die "nvidia-smi not found (NVIDIA GPU required)"
+command -v python3   >/dev/null || die "python3 required"
+
+mkdir -p "$OUT"
+
+# --------------------------------------------------------------- capabilities
+# nvidia-smi's total includes a driver reserve that no allocation can touch
+# (~460 MiB on a 16 GB card). Headroom measured against it is fiction, so ask
+# CUDA what it really exposes when a torch build happens to be available.
+VRAM_TOTAL=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits | head -1)
+VRAM_BASE=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits | head -1)
+read_usable() {
+  # Must be cudaMemGetInfo's total, which is what CUDA will actually hand out.
+  # NVML/nvidia-smi report the physical size of the board instead — using those
+  # yields a driver reserve of 0 and hides the very gap this is here to expose.
+  local snippet='import torch; print(int(torch.cuda.mem_get_info()[1] / 2**20))'
+  local py
+  for py in "${CTXPROBE_PYTHON:-}" python3 \
+            "$HOME/miniconda3/envs/"*/bin/python "$HOME/venv/bin/python" ; do
+    [[ -n "$py" && -x "$(command -v "$py" 2>/dev/null)" ]] || continue
+    local v; v=$("$py" -c "$snippet" 2>/dev/null)
+    [[ -n "$v" ]] && { echo "$v"; return 0; }
+  done
+  return 1
+}
+VRAM_USABLE=$(read_usable || true)
+GPU_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader | head -1)
+
+# Trained context length, so --max defaults to something the model supports.
+if [[ -z "$MAX" ]]; then
+  MAX=$(python3 - "$MODEL" <<'PY' 2>/dev/null || true
+import struct, sys
+# Minimal GGUF reader: walk the KV table looking for *.context_length.
+f = open(sys.argv[1], 'rb')
+if f.read(4) != b'GGUF': sys.exit(1)
+ver = struct.unpack('<I', f.read(4))[0]
+n_tensors, n_kv = struct.unpack('<QQ', f.read(16))
+def rd_str():
+    (n,) = struct.unpack('<Q', f.read(8)); return f.read(n).decode('utf-8', 'replace')
+SCALAR = {0:'<b',1:'<B',2:'<h',3:'<H',4:'<i',5:'<I',6:'<f',7:'<?',10:'<q',11:'<Q',12:'<d'}
+SIZE   = {0:1,1:1,2:2,3:2,4:4,5:4,6:4,7:1,10:8,11:8,12:8}
+def rd_val(t):
+    if t == 8: return rd_str()
+    if t == 9:
+        (et,) = struct.unpack('<I', f.read(4)); (n,) = struct.unpack('<Q', f.read(8))
+        return [rd_val(et) for _ in range(n)]
+    return struct.unpack(SCALAR[t], f.read(SIZE[t]))[0]
+for _ in range(n_kv):
+    k = rd_str(); (t,) = struct.unpack('<I', f.read(4)); v = rd_val(t)
+    if k.endswith('.context_length'):
+        print(min(int(v), 131072)); sys.exit(0)
+sys.exit(1)
+PY
+)
+  [[ -n "$MAX" ]] || MAX=32768
+fi
+
+round_step() { echo $(( ($1 / STEP) * STEP )); }
+MIN=$(round_step "$MIN"); MAX=$(round_step "$MAX")
+(( MIN >= STEP )) || MIN=$STEP
+(( MAX > MIN )) || die "--max ($MAX) must exceed --min ($MIN)"
+
+# The bracket in [l]lama-server stops the pattern from matching this script's
+# own command line — otherwise pkill takes out the caller along with the server.
+cleanup() { pkill -f "[l]lama-server.*--port $PORT" 2>/dev/null; sleep 2; }
+trap cleanup EXIT INT TERM
+
+RESULTS_TSV="$OUT/results.tsv"
+: > "$RESULTS_TSV"
+
+# ------------------------------------------------------------------ one trial
+# Boots the server at $1 tokens and returns 0 only if it survives both prompts.
+# Echoes: verdict<TAB>peak_vram<TAB>prefill_tps<TAB>gen_tps
+try_ctx() {
+  local ctx="$1"
+  local log="$OUT/ctx${ctx}.log"
+  cleanup
+
+  CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}" "$LLAMA_BIN" \
+    -m "$MODEL" --host 127.0.0.1 --port "$PORT" \
+    -ngl 999 -c "$ctx" --parallel "$PARALLEL" \
+    --cache-type-k "$KV" --cache-type-v "$KV" \
+    "${EXTRA[@]}" > "$log" 2>&1 &
+  local srv=$!
+
+  local peak=0 ready=no
+  for _ in $(seq 1 300); do
+    kill -0 $srv 2>/dev/null || break
+    local u; u=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits | head -1)
+    (( u > peak )) && peak=$u
+    if curl -sf --max-time 2 "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; then ready=yes; break; fi
+    sleep 2
+  done
+
+  if [[ "$ready" != yes ]]; then
+    kill $srv 2>/dev/null
+    echo -e "LOAD_FAIL\t$peak\t\t"; return 1
+  fi
+
+  # Short prompt: proves it decodes at all.
+  curl -s --max-time 180 "http://127.0.0.1:$PORT/v1/chat/completions" \
+    -H 'content-type: application/json' \
+    -d '{"messages":[{"role":"user","content":"Write one sentence about the sea."}],"max_tokens":32}' \
+    >/dev/null 2>&1
+
+  if grep -qiE "CUDA error|ggml_abort|out of memory" "$log"; then
+    kill $srv 2>/dev/null
+    echo -e "DECODE_OOM\t$peak\t\t"; return 1
+  fi
+
+  # Long prompt: the test that actually qualifies this context size.
+  local ok
+  ok=$(python3 - "$ctx" "$PORT" "$FILL" <<'PY'
+import json, random, sys, urllib.request
+ctx, port, fill = int(sys.argv[1]), sys.argv[2], int(sys.argv[3])
+words = "alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo lima mike".split()
+rnd = random.Random(ctx)
+# Random words tokenize at roughly 1.5 tokens each, so this lands near `fill`%
+# of the window without needing a tokenizer round-trip.
+n = max(1, int(ctx * (fill / 100.0) / 1.5))
+body = json.dumps({"messages": [{"role": "user",
+                                 "content": " ".join(rnd.choice(words) for _ in range(n))}],
+                   "max_tokens": 16}).encode()
+req = urllib.request.Request(f"http://127.0.0.1:{port}/v1/chat/completions",
+                             data=body, headers={"content-type": "application/json"})
+try:
+    urllib.request.urlopen(req, timeout=900).read(); print("ok")
+except Exception:
+    print("fail")
+PY
+)
+
+  local u; u=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits | head -1)
+  (( u > peak )) && peak=$u
+
+  # Speeds come from the server's own timing lines — present regardless of how
+  # the HTTP response shape changes between llama.cpp versions.
+  # Both timing lines end in "(... ms per token, N tokens per second)", so they
+  # must be told apart by their label first — matching the shared suffix alone
+  # reports the generation rate as the prefill rate.
+  local gen pre
+  pre=$(grep 'prompt eval time' "$log" | tail -1 \
+        | grep -oE '[0-9.]+ tokens per second' | grep -oE '^[0-9.]+')
+  gen=$(grep 'eval time' "$log" | grep -v 'prompt eval' | tail -1 \
+        | grep -oE '[0-9.]+ tokens per second' | grep -oE '^[0-9.]+')
+
+  kill $srv 2>/dev/null; sleep 2
+
+  if [[ "$ok" != ok ]] || grep -qiE "CUDA error|ggml_abort|out of memory" "$log"; then
+    echo -e "LONG_OOM\t$peak\t${pre:-}\t${gen:-}"; return 1
+  fi
+  echo -e "PASS\t$peak\t${pre:-}\t${gen:-}"; return 0
+}
+
+record() { printf '%s\t%s\n' "$1" "$2" >> "$RESULTS_TSV"; }
+
+if (( JSON == 0 )); then
+  echo "ctxprobe"
+  echo "  model     : $(basename "$MODEL") ($(du -h "$MODEL" | cut -f1))"
+  echo "  gpu       : $GPU_NAME"
+  echo "  vram      : ${VRAM_TOTAL} MiB reported by nvidia-smi, ${VRAM_BASE} MiB already in use"
+  if [[ -n "$VRAM_USABLE" ]]; then
+  echo "              ${VRAM_USABLE} MiB actually allocatable ($(( VRAM_TOTAL - VRAM_USABLE )) MiB is driver reserve)"
+  else
+  echo "              (no torch found, so the real allocatable total is unknown —"
+  echo "               nvidia-smi's figure above includes driver reserve. Set"
+  echo "               CTXPROBE_PYTHON to a python that can import torch.)"
+  fi
+  echo "  kv cache  : $KV | slots: $PARALLEL | step: $STEP | long prompt fills ${FILL}%"
+  echo
+  printf '%-10s %-11s %-11s %-10s %s\n' CONTEXT RESULT PEAK_VRAM PREFILL GENERATE
+  printf '%.0s-' {1..60}; echo
+fi
+
+emit() {  # ctx verdict peak prefill gen
+  (( JSON == 1 )) && return 0
+  printf '%-10s %-11s %-11s %-10s %s\n' "$1" "$2" "${3:-?}" "${4:-n/a}" "${5:-n/a}"
+}
+
+BEST=0; BEST_PRE=""; BEST_GEN=""; BEST_PEAK=""
+
+if [[ -n "$LIST" ]]; then
+  for c in $LIST; do
+    c=$(round_step "$c")
+    IFS=$'\t' read -r v p pre gen < <(try_ctx "$c")
+    emit "$c" "$v" "$p" "$pre" "$gen"
+    record "$c" "$v"
+    [[ "$v" == PASS ]] && (( c > BEST )) && { BEST=$c; BEST_PRE=$pre; BEST_GEN=$gen; BEST_PEAK=$p; }
+  done
+else
+  # Binary search. lo is the largest known-good, hi the smallest known-bad.
+  lo=0; hi=$(( MAX + STEP ))
+  IFS=$'\t' read -r v p pre gen < <(try_ctx "$MIN")
+  emit "$MIN" "$v" "$p" "$pre" "$gen"; record "$MIN" "$v"
+  if [[ "$v" != PASS ]]; then
+    (( JSON == 0 )) && { echo; echo "Even the minimum ($MIN) does not run. Try a smaller quant or --kv q4_0."; }
+    [[ $JSON == 1 ]] && echo "{\"model\":\"$(basename "$MODEL")\",\"max_context\":0}"
+    exit 2
+  fi
+  lo=$MIN; BEST=$MIN; BEST_PRE=$pre; BEST_GEN=$gen; BEST_PEAK=$p
+
+  IFS=$'\t' read -r v p pre gen < <(try_ctx "$MAX")
+  emit "$MAX" "$v" "$p" "$pre" "$gen"; record "$MAX" "$v"
+  if [[ "$v" == PASS ]]; then
+    BEST=$MAX; BEST_PRE=$pre; BEST_GEN=$gen; BEST_PEAK=$p
+    lo=$MAX; hi=$(( MAX + STEP ))
+  else
+    hi=$MAX
+    while (( hi - lo > STEP )); do
+      mid=$(( (lo + hi) / 2 )); mid=$(round_step "$mid")
+      (( mid <= lo )) && break
+      (( mid >= hi )) && break
+      IFS=$'\t' read -r v p pre gen < <(try_ctx "$mid")
+      emit "$mid" "$v" "$p" "$pre" "$gen"; record "$mid" "$v"
+      if [[ "$v" == PASS ]]; then
+        lo=$mid; BEST=$mid; BEST_PRE=$pre; BEST_GEN=$gen; BEST_PEAK=$p
+      else
+        hi=$mid
+      fi
+    done
+  fi
+fi
+
+(( KEEP == 0 )) && find "$OUT" -name 'ctx*.log' -delete 2>/dev/null
+
+if (( JSON == 1 )); then
+  python3 - "$MODEL" "$GPU_NAME" "$BEST" "$BEST_PEAK" "$BEST_PRE" "$BEST_GEN" \
+           "$KV" "$PARALLEL" "$VRAM_TOTAL" "${VRAM_USABLE:-}" <<'PY'
+import json, os, sys
+m, gpu, best, peak, pre, gen, kv, par, total, usable = sys.argv[1:11]
+print(json.dumps({
+    "model": os.path.basename(m), "gpu": gpu,
+    "max_context": int(best),
+    "peak_vram_mib": int(peak) if peak else None,
+    "prefill_tps": float(pre) if pre else None,
+    "generate_tps": float(gen) if gen else None,
+    "kv_cache_type": kv, "slots": int(par),
+    "vram_total_mib": int(total),
+    "vram_allocatable_mib": int(usable) if usable else None,
+}, indent=2))
+PY
+else
+  echo
+  if (( BEST > 0 )); then
+    echo "Largest context that actually runs: $BEST tokens"
+    echo "  peak VRAM ${BEST_PEAK:-?} MiB | prefill ${BEST_PRE:-?} tok/s | generate ${BEST_GEN:-?} tok/s"
+    echo
+    echo "Run it with:"
+    echo "  llama-server -m $MODEL -ngl 999 -c $BEST \\"
+    echo "    --cache-type-k $KV --cache-type-v $KV --parallel $PARALLEL${EXTRA[*]:+ ${EXTRA[*]}}"
+  else
+    echo "No context size passed."
+  fi
+  echo
+  echo "PASS means it survived a short prompt AND one filling ${FILL}% of the window."
+  echo "LONG_OOM means the short prompt passed but a realistic one crashed it —"
+  echo "that gap is why load-time estimates alone can't qualify a context size."
+fi
