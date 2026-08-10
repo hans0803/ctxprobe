@@ -62,11 +62,37 @@ cparams.n_ctx = GGML_PAD(cparams.n_ctx, 256);
 想確認機制的話用 `CUDA_MODULE_LOADING=EAGER`：
 它會把所有 kernel 提前載入，把執行期崩潰變成你不可能忽略的啟動失敗。
 
+64 來自 `MMQ_DP4A_MAX_BATCH_SIZE`，但要注意它外面那層條件：
+
+```c
+return !fp16_mma_hardware_available(cc) || ne11 < MMQ_DP4A_MAX_BATCH_SIZE;
+```
+
+在沒有 FP16 MMA 的卡上，左邊會短路，全部走 dp4a ——
+根本不存在 64 這個切換點。這個門檻既是 llama.cpp 的性質，
+也同樣是你那張卡世代的性質。
+
 相關的一點：子程序這樣死掉之後會變成殭屍程序（defunct），
 而只追蹤自己狀態的上層 gateway 會繼續回報這個部署是健康的。
 要檢查程序，不是檢查狀態端點。
 
-## 5. Thinking 模型會回傳空的 content
+## 5. PEAK_VRAM 沒辦法告訴你什麼會失敗
+
+大家第一眼會看的那一欄，正好是回答不了這個問題的那一欄：
+
+| Context | 峰值顯存 | 判定 |
+|---|---|---|
+| 34,816 | 15845 MiB | PASS |
+| 35,072 | 15847 MiB | **CUDA OOM** |
+
+差 2 MiB，結果相反。這不是取樣不夠密的問題，是結構性的：
+失敗的那次配置**正因為失敗了**所以從來不會出現在用量裡，
+而它要求的量本來就遠低於 `nvidia-smi` 的 1 MiB 解析度。
+
+把峰值顯存讀成「還剩多少餘裕」，永遠不要讀成「離失敗有多近」。
+只有判定那一欄能回答後者。
+
+## 6. Thinking 模型會回傳空的 content
 
 Qwen3.6 這類推理模型會把所有東西放進 `reasoning_content`。
 在 1200 token 的預算下，模型還在思考就撞到上限，於是 `content` 回傳空字串、
@@ -86,7 +112,7 @@ llama-server ... --reasoning-budget 0
 
 只看 tokens/s 的 benchmark 不會發現這件事；會檢查輸出的才會。
 
-## 6. 桌面環境的程序會佔住獨立顯卡
+## 7. 桌面環境的程序會佔住獨立顯卡
 
 兩個各自獨立的元凶，在我們的機器上合計約 590 MiB：
 

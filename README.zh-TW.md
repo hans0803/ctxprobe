@@ -22,22 +22,28 @@ RTX 5060 Ti 16GB 的實際輸出：
   vram      : 16311 MiB reported by nvidia-smi, 15 MiB already in use
               15849 MiB actually allocatable (462 MiB is driver reserve)
   kv cache  : q8_0 | slots: 1 | step: 256 | long prompt fills 95%
+  cuda      : CUDA_MODULE_LOADING=LAZY (default) | -ngl 999
+  attention : flash_attn=on (forced by quantised V cache)
 
 CONTEXT    RESULT      PEAK_VRAM   PREFILL    GENERATE   FILLED
 ------------------------------------------------------------------------
-32768      PASS        15767       867.97     24.76      31057
+32768      PASS        15767       968.60     28.55      4042
 36864      DECODE_OOM  15845       n/a        n/a        —
-34816      PASS        15845       858.39     24.62      32997
+34816      PASS        15845       968.55     28.55      4042
 35840      DECODE_OOM  15805       n/a        n/a        —
 35328      DECODE_OOM  15787       n/a        n/a        —
-35072      LONG_OOM    15847       89.48      26.36      —
+35072      LONG_OOM    15847       94.03      26.47      died@64
+
+Validating 34816 at 95% fill...
+  confirmed: 34816 (32826 tokens filled)
 
 Largest context that actually runs: 34816 tokens
-  peak VRAM 15845 MiB | prefill 858.39 tok/s | generate 24.62 tok/s
+  peak VRAM 15845 MiB | prefill 859.74 tok/s | generate 24.89 tok/s
 ```
 
-六次啟動就夾出上限。注意最後一行：35072 **載入成功、短 prompt 也能全速生成**，
-卻在真實長度的 prompt 下死掉 —— 這一行是任何載入期估算都產生不出來的。
+不到兩分鐘。注意 `died@64`：35072 **載入成功、18-token 的 prompt 也能全速生成**，
+卻死在一個 64-token 的 prompt 上 —— 這一行是任何載入期估算都產生不出來的。
+接著勝出者會再用完整長度的 prompt 驗證一次，它的速度數字就來自那一輪。
 
 ## 為什麼需要這個
 
@@ -239,6 +245,14 @@ ctxprobe MODEL.gguf [選項] [-- 額外的 llama-server 參數]
 只是會標示為對照組，而不是當成一個可用的配置。
 
 多卡配置不在範圍內；`llama-fit-params` 已經做得很好。
+
+**PASS 沒有涵蓋到什麼。** 階梯只要求回傳 8 個 token。
+真實使用是在滿的 KV cache 上生成好幾千個 token ——
+batch 為 1、走的是另一條矩陣乘法路徑（MMVQ 而不是 MMQ）、而且持續好幾分鐘。
+那條路徑在這裡從來沒有被走過。
+就機制而言沒有理由認為它會配置得比 prefill 更多，
+但「理論上不會」不等於「量過了」，
+而這個工具存在的理由，正是這兩者的差別。
 
 ## 授權
 

@@ -63,11 +63,38 @@ window", which matters because it makes checking cheap. Confirm the mechanism
 with `CUDA_MODULE_LOADING=EAGER`: it loads every kernel up front, turning the
 runtime crash into a startup failure you can't miss.
 
+64 comes from `MMQ_DP4A_MAX_BATCH_SIZE`, but note the guard around it:
+
+```c
+return !fp16_mma_hardware_available(cc) || ne11 < MMQ_DP4A_MAX_BATCH_SIZE;
+```
+
+On a card without FP16 MMA the left side short-circuits and everything uses
+dp4a, so there is no switch at 64 at all. The threshold is a property of your
+GPU generation as much as of llama.cpp.
+
 Related: when the child dies this way it becomes a defunct process, and a
 supervising gateway that only tracks its own state will keep reporting the
 deployment as healthy. Check the process, not the status endpoint.
 
-## 5. Thinking models return empty content
+## 5. PEAK_VRAM cannot tell you what will fail
+
+The column everyone reads first is the one that can't answer the question:
+
+| Context | Peak VRAM | Verdict |
+|---|---|---|
+| 34,816 | 15845 MiB | PASS |
+| 35,072 | 15847 MiB | **CUDA OOM** |
+
+Two MiB apart, opposite outcomes. This isn't a sampling problem — it's
+structural. The allocation that fails never appears in usage *because it
+failed*, and what it was asking for is well under `nvidia-smi`'s 1 MiB
+resolution anyway.
+
+Read peak VRAM as "how much headroom is left", never as "how close to failing".
+The verdict column is the only one that answers that.
+
+## 6. Thinking models return empty content
 
 Qwen3.6 and similar reasoning models put everything in `reasoning_content`.
 With a 1200-token budget the model was still thinking when it hit the limit, so
@@ -87,7 +114,7 @@ llama-server ... --reasoning-budget 0
 
 Benchmarks that only look at tokens/s won't notice; ones that check output will.
 
-## 6. Desktop processes squat on the discrete GPU
+## 7. Desktop processes squat on the discrete GPU
 
 Two separate offenders, worth ~590 MiB together on our box:
 

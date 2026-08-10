@@ -22,23 +22,29 @@ Real output, RTX 5060 Ti 16GB:
   vram      : 16311 MiB reported by nvidia-smi, 15 MiB already in use
               15849 MiB actually allocatable (462 MiB is driver reserve)
   kv cache  : q8_0 | slots: 1 | step: 256 | long prompt fills 95%
+  cuda      : CUDA_MODULE_LOADING=LAZY (default) | -ngl 999
+  attention : flash_attn=on (forced by quantised V cache)
 
 CONTEXT    RESULT      PEAK_VRAM   PREFILL    GENERATE   FILLED
 ------------------------------------------------------------------------
-32768      PASS        15767       867.97     24.76      31057
+32768      PASS        15767       968.60     28.55      4042
 36864      DECODE_OOM  15845       n/a        n/a        —
-34816      PASS        15845       858.39     24.62      32997
+34816      PASS        15845       968.55     28.55      4042
 35840      DECODE_OOM  15805       n/a        n/a        —
 35328      DECODE_OOM  15787       n/a        n/a        —
-35072      LONG_OOM    15847       89.48      26.36      —
+35072      LONG_OOM    15847       94.03      26.47      died@64
+
+Validating 34816 at 95% fill...
+  confirmed: 34816 (32826 tokens filled)
 
 Largest context that actually runs: 34816 tokens
-  peak VRAM 15845 MiB | prefill 858.39 tok/s | generate 24.62 tok/s
+  peak VRAM 15845 MiB | prefill 859.74 tok/s | generate 24.89 tok/s
 ```
 
-Six boots to bracket the ceiling. Note the last row: 35072 loaded, decoded a
-short prompt at full speed, and still died on a real one — that's the row no
-load-time estimate can produce.
+Under two minutes. Note `died@64`: 35072 loaded, served an 18-token prompt at
+full speed, and died on a 64-token one — the row no load-time estimate can
+produce. The winner is then re-validated against a full-length prompt, which is
+where its speed figures come from.
 
 ## Why this exists
 
@@ -244,6 +250,13 @@ matters, so those runs belong here too — reported as a labelled comparison
 rather than as a working configuration.
 
 Multi-GPU placement is out of scope; `llama-fit-params` handles it well.
+
+**What a PASS does not cover.** The ladder asks for 8 tokens back. Real use
+generates thousands against a full KV cache — batch of 1, a different matmul
+path (MMVQ rather than MMQ), sustained for minutes. That path is never
+exercised here. Nothing in the mechanism suggests it should allocate more than
+prefill already did, but "should" is not "measured", and this tool exists
+because that distinction matters.
 
 ## License
 

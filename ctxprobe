@@ -184,6 +184,13 @@ printf 'context\tresult\tpeak_vram_mib\tprefill_tps\tgenerate_tps\tprompt_tokens
 # Echoes: verdict<TAB>peak_vram<TAB>prefill_tps<TAB>gen_tps<TAB>prompt_tokens
 try_ctx() {
   local ctx="$1"
+  # quick: ladder to 4096 only. Every failure ever measured landed on 64 or 512
+  # (MMQ_DP4A_MAX_BATCH_SIZE and n_ubatch), and batch shape stops changing past
+  # n_ubatch, so filling the window during the search costs ~85% of the runtime
+  # to re-test a dimension nothing has ever failed on.
+  # full: adds the fill% rung. Used once, on the winner, so the number that gets
+  # reported is still backed by a full-length prompt.
+  local mode="${2:-quick}"
   local log="$OUT/ctx${ctx}.log"
   cleanup
 
@@ -228,9 +235,9 @@ try_ctx() {
   # while still finishing at a full-size prompt for anything that survives.
   # It also reports *where* it died, which one long prompt cannot.
   local ok
-  ok=$(python3 - "$ctx" "$PORT" "$FILL" <<'LADDER'
+  ok=$(python3 - "$ctx" "$PORT" "$FILL" "$mode" <<'LADDER'
 import json, random, sys, urllib.request
-ctx, port, fill = int(sys.argv[1]), sys.argv[2], int(sys.argv[3])
+ctx, port, fill, mode = int(sys.argv[1]), sys.argv[2], int(sys.argv[3]), sys.argv[4]
 
 GEN = 8
 target = max(1, int(ctx * fill / 100) - GEN)
@@ -277,11 +284,15 @@ def build(want, seed):
     return text, n
 
 # Each rung crosses a real threshold rather than being a round number:
-#   64   MMQ_DP4A_MAX_BATCH_SIZE — dp4a kernels below it, mma at or above
+#   64   MMQ_DP4A_MAX_BATCH_SIZE — dp4a below it, mma at or above. Only a real
+#        boundary where FP16 MMA exists: mmq.cu short-circuits to dp4a for the
+#        whole range otherwise, so on older cards this rung crosses nothing
 #   512  n_ubatch default — the first full micro-batch, where the pool sizes up
 #   4096 past n_batch (2048), the other batching bound
 # Measured failures so far land exactly on the first two.
-rungs = [r for r in (64, 512, 4096) if r < target] + [target]
+rungs = [r for r in (64, 512, 4096) if r < target]
+if mode == 'full' or not rungs:
+    rungs.append(target)
 used = 0
 for i, rung in enumerate(rungs):
     text, n = build(rung, i)
@@ -414,6 +425,24 @@ else
   fi
 fi
 
+# Validate the winner once at full length. The search deliberately skipped that
+# rung, and this is also the independent second run of BEST — cost is +1 boot,
+# not xN, which is enough to catch an outside disturbance during the search.
+if (( BEST > 0 )); then
+  (( JSON == 0 )) && { echo; echo "Validating $BEST at ${FILL}% fill..."; }
+  while (( BEST >= STEP )); do
+    IFS=$'\t' read -r v p pre gen fl < <(try_ctx "$BEST" full)
+    record "$BEST" "final:$v" "$p" "$pre" "$gen" "$fl"
+    if [[ "$v" == PASS ]]; then
+      BEST_PEAK=$p; BEST_PRE=$pre; BEST_GEN=$gen
+      (( JSON == 0 )) && echo "  confirmed: $BEST ($fl tokens filled)"
+      break
+    fi
+    (( JSON == 0 )) && echo "  $BEST failed at full length ($v) — backing off one step"
+    BEST=$(( BEST - STEP ))
+  done
+fi
+
 (( KEEP == 0 )) && find "$OUT" -name 'ctx*.log' -delete 2>/dev/null
 
 if (( JSON == 1 )); then
@@ -467,11 +496,17 @@ else
     echo "No context size passed."
   fi
   echo
-  echo "PASS      cleared every rung: 64, 512, 4096 and ${FILL}% of the window"
+  echo "PASS      cleared the search ladder: 64, 512, 4096 tokens"
+  echo "          (only the winner is re-tested at ${FILL}% of the window)"
   echo "LONG_OOM  a short prompt was fine but a longer one crashed it — the gap"
   echo "          that makes load-time estimates insufficient"
   echo "SILENT    ran without crashing but produced no tokens; usually a thinking"
   echo "          model spending its budget on reasoning, not a memory problem"
+  echo
+  echo
+  echo "Speeds in the table come from the 4096-token rung, so they describe a"
+  echo "lightly-loaded window. The figures reported for the winner above come"
+  echo "from the ${FILL}% validation and are the ones to quote."
   echo
   echo "Per-run data: $RESULTS_TSV"
 fi
