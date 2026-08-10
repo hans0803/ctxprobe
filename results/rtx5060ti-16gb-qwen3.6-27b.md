@@ -33,7 +33,8 @@ the other 48 are linear attention with fixed-size state. KV cache is therefore m
 cheaper than a conventional 27B — about **34 MiB per 1K tokens** at q8_0.
 
 Why IQ4_XS: it is the largest Q4-class quant that fits. `Q4_K_S` is 15.86 GB and
-`Q4_K_M` is 16.82 GB — both exceed the card before any KV cache exists.
+`Q4_K_M` is 16.82 GB — both exceed the card before any KV cache exists. How to
+make that choice on your own card: [model-quant.md](../docs/model-quant.md).
 
 ## Context ceiling
 
@@ -70,7 +71,8 @@ memory, not throughput, until you hit the wall.
 ## KV cache: q8_0 vs f16
 
 Same model, same card, only `--cache-type-k/v` changed. Both ceilings found by
-binary search with the window filled to 95%.
+binary search with the window filled to 95%. What the setting does and when not
+to use it: [kv-cache-quant.md](../docs/kv-cache-quant.md).
 
 | KV type | Max context | Peak VRAM | Prefill | Generate |
 |---|---|---|---|---|

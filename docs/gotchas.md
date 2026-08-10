@@ -104,5 +104,9 @@ grep -cE 'libcuda|libnvidia-encode' /proc/<pid>/maps   # want 0
 
 Scope note: this list covers things that consume or waste **GPU memory on a
 single card** — that's the question ctxprobe answers. What it costs to spill
-past the card is worth measuring for contrast, but it's a different list.
+past the card is measured separately in [spill-cost.md](spill-cost.md).
 Multi-GPU placement is out of scope; `llama-fit-params` handles it.
+
+See also: [model-quant.md](model-quant.md) for picking a quant that fits, and
+[kv-cache-quant.md](kv-cache-quant.md) for halving the cache that grows with
+context.

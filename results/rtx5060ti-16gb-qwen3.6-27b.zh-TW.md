@@ -33,6 +33,7 @@ Qwen3.6-27B 有 64 層，但其中**只有 16 層是 full attention**（`full_at
 
 為什麼選 IQ4_XS：它是裝得下的最大 Q4 級量化。`Q4_K_S` 是 15.86 GB、
 `Q4_K_M` 是 16.82 GB —— 在還沒有任何 KV cache 之前就已經超出這張卡。
+怎麼在你自己的卡上做這個選擇：[model-quant.zh-TW.md](../docs/model-quant.zh-TW.md)。
 
 ## Context 上限
 
@@ -69,6 +70,7 @@ Qwen3.6-27B 有 64 層，但其中**只有 16 層是 full attention**（`full_at
 
 同一個模型、同一張卡，只改 `--cache-type-k/v`。
 兩個上限都是用二分搜尋、視窗灌到 95% 找出來的。
+這個設定在做什麼、什麼時候不該用：[kv-cache-quant.zh-TW.md](../docs/kv-cache-quant.zh-TW.md)。
 
 | KV 型別 | 最大 context | 峰值顯存 | Prefill | 生成 |
 |---|---|---|---|---|

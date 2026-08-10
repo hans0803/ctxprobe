@@ -103,5 +103,10 @@ grep -cE 'libcuda|libnvidia-encode' /proc/<pid>/maps   # 要是 0
 ---
 
 範圍說明：這份清單涵蓋的是**單張顯卡上會消耗或浪費顯存**的東西 ——
-那正是 ctxprobe 要回答的問題。溢出到顯卡之外要付出什麼代價，值得測來當對照，
-但那是另一份清單。多卡配置不在範圍內，`llama-fit-params` 處理得很好。
+那正是 ctxprobe 要回答的問題。溢出到顯卡之外的代價另外量在
+[spill-cost.zh-TW.md](spill-cost.zh-TW.md)。
+多卡配置不在範圍內，`llama-fit-params` 處理得很好。
+
+延伸閱讀：[model-quant.zh-TW.md](model-quant.zh-TW.md) 談怎麼挑一個裝得下的量化，
+[kv-cache-quant.zh-TW.md](kv-cache-quant.zh-TW.md) 談怎麼把隨 context 成長的
+cache 砍半。

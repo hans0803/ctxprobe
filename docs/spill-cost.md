@@ -98,3 +98,7 @@ It isn't always the wrong call:
 What isn't fine is spilling *by accident* — which is the common case, because
 nothing announces it. Check the layer count in the startup log, or run
 `ctxprobe`, which refuses to call a partial offload a pass.
+
+[gotchas.md](gotchas.md) collects the other things that quietly eat the VRAM you
+were counting on, several of which are what pushes a run into spilling in the
+first place.

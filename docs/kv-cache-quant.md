@@ -67,8 +67,12 @@ throughput one.
 
 ## The practical recommendation
 
-**Start with `q8_0`.** It roughly doubles your context for a quality cost you
+**Start with `q8_0`.** It buys a large amount of context for a quality cost you
 are unlikely to notice.
+
+This only matters once the weights themselves fit — see
+[model-quant.md](model-quant.md) for that, and [spill-cost.md](spill-cost.md)
+for what happens if they don't. No KV setting rescues a model that spills.
 
 Reach for `f16` when you are doing something precision-sensitive and your
 context is short enough that you can afford it. Reach for `q4_0` only when

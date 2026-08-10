@@ -155,8 +155,12 @@ ctxprobe MODEL.gguf [選項] [-- 額外的 llama-server 參數]
 |---|---|---|---|---|---|---|
 | RTX 5060 Ti 16GB | Qwen3.6-27B | IQ4_XS | q8_0 | 34,816 | 858 tok/s | 24.6 tok/s |
 | RTX 5060 Ti 16GB | Qwen3.6-27B | IQ4_XS | f16 | 20,224 | 923 tok/s | 26.9 tok/s |
+| RTX 5060 Ti 8GB *(模擬)* | Qwen3.6-27B | IQ4_XS | q8_0 | 4,096 † | 391 tok/s | 5.11 tok/s |
 
-這兩行是同一個模型、同一張卡，只差一個參數。完整的實測過程
+† 裝不下：65 層中只有 28 層在 GPU 上，其餘在系統記憶體。
+見 [spill-cost.zh-TW.md](docs/spill-cost.zh-TW.md)。
+
+前兩行是同一個模型、同一張卡，只差一個參數。完整的實測過程
 （包含騰出顯存後上限怎麼往上跳）在
 [rtx5060ti-16gb-qwen3.6-27b.zh-TW.md](results/rtx5060ti-16gb-qwen3.6-27b.zh-TW.md)。
 

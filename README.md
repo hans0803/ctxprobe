@@ -160,8 +160,12 @@ Without torch everything still works, you just don't get that line.
 |---|---|---|---|---|---|---|
 | RTX 5060 Ti 16GB | Qwen3.6-27B | IQ4_XS | q8_0 | 34,816 | 858 tok/s | 24.6 tok/s |
 | RTX 5060 Ti 16GB | Qwen3.6-27B | IQ4_XS | f16 | 20,224 | 923 tok/s | 26.9 tok/s |
+| RTX 5060 Ti 8GB *(simulated)* | Qwen3.6-27B | IQ4_XS | q8_0 | 4,096 † | 391 tok/s | 5.11 tok/s |
 
-Those two rows are the same model on the same card, one flag apart. Full run,
+† Does not fit: only 28 of 65 layers on the GPU, the rest in system RAM. See
+[spill-cost.md](docs/spill-cost.md).
+
+The first two rows are the same model on the same card, one flag apart. Full run,
 including how the ceiling moved as VRAM was freed:
 [rtx5060ti-16gb-qwen3.6-27b.md](results/rtx5060ti-16gb-qwen3.6-27b.md).
 
