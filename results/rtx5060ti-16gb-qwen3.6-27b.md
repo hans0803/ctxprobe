@@ -106,6 +106,38 @@ context against q8_0's 34K, and generation slows as the window fills — at a
 comparable 16,384 the f16 run gave 27.28 tok/s, within noise of the q8_0 figures
 at similar depth. KV type is a memory decision, not a speed one.
 
+## Lazy vs eager kernel loading
+
+CUDA 12 loads a kernel's code the first time something touches it. That makes
+the ceiling depend on which kernels a given run happened to reach.
+`CUDA_MODULE_LOADING=EAGER` loads all of them at startup instead:
+
+| Module loading | Max context | Difference |
+|---|---|---|
+| `LAZY` (default) | 34,816 | — |
+| **`EAGER`** | **25,344** | **−9,472 (−27%)** |
+
+That gap is not a rounding error. It is how much of the 34,816 was resting on
+"this workload never instantiates another kernel". Change the sampler, add a
+grammar, feed a different batch shape, and a config that passed can still die in
+production — the LAZY number is a property of the test, the EAGER number is a
+property of the config.
+
+The two also fail in different places, which confirms the mechanism:
+
+| Mode | Where it fails |
+|---|---|
+| LAZY | `cudaFuncSetAttribute` at `mmq.cuh:1375` — loading a kernel |
+| EAGER | `alloc` at `ggml-cuda.cu:589` — the CUDA memory pool |
+
+Note EAGER does **not** make the prompt ladder redundant. 25,600 still passes a
+short prompt and dies on a longer one, because ggml's pool grows on demand
+regardless of when kernels were loaded. A single successful boot is not a pass
+in either mode.
+
+Which number to use: `LAZY` if you control the workload and want the most
+context, `EAGER` if the config has to survive whatever gets thrown at it.
+
 ## Prefill vs prompt length
 
 Measured against the deployed 34,816 config. Each prompt is randomly generated

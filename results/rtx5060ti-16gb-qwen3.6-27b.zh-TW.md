@@ -103,6 +103,38 @@ cache 的預算，所以把每個 token 的成本減半，延長的是那塊剩�
 跟 q8_0 在相近深度的數字差在雜訊範圍內。
 KV 型別是記憶體決策，不是速度決策。
 
+## Lazy 與 eager kernel 載入
+
+CUDA 12 是在「某個 kernel 第一次被碰到」時才載入它的程式碼。
+這使得天花板取決於「這一輪剛好用到了哪些 kernel」。
+`CUDA_MODULE_LOADING=EAGER` 則是在啟動時就全部載入：
+
+| Module loading | 最大 context | 差距 |
+|---|---|---|
+| `LAZY`（預設） | 34,816 | — |
+| **`EAGER`** | **25,344** | **−9,472（−27%）** |
+
+這個落差不是誤差。它代表 34,816 裡面有多少是押在
+「這個工作負載永遠不會實例化另一個 kernel」上面。
+換個 sampler、加個 grammar、餵進不同的 batch 形狀，
+一個通過測試的 config 仍然可能在正式環境掛掉 ——
+LAZY 的數字是**這次測試**的性質，EAGER 的數字才是**這個 config** 的性質。
+
+兩者失敗的位置也不同，這反過來確認了機制：
+
+| 模式 | 失敗在哪 |
+|---|---|
+| LAZY | `cudaFuncSetAttribute` @ `mmq.cuh:1375` —— 載入 kernel |
+| EAGER | `alloc` @ `ggml-cuda.cu:589` —— CUDA 記憶體池 |
+
+注意 EAGER **並不會**讓 prompt 階梯變得多餘。
+25,600 在 EAGER 之下仍然是「短 prompt 過、長 prompt 死」，
+因為 ggml 的記憶體池本來就會依需求成長，跟 kernel 何時載入無關。
+在任何一種模式下，「開得起來」都不等於通過。
+
+該用哪個數字：如果你能掌控工作負載、又想要最多的 context，用 `LAZY`；
+如果這個 config 得撐住別人丟過來的任何東西，用 `EAGER`。
+
 ## Prefill 與 prompt 長度的關係
 
 對照已部署的 34,816 配置量測。每個 prompt 都是隨機產生的，

@@ -25,6 +25,9 @@
 #                     Measured with the server tokenizer, so it is the real figure
 #   --port N          port for the probe server (default 6099)
 #   --out DIR         where logs go (default ./ctxprobe-out)
+#   --eager           set CUDA_MODULE_LOADING=EAGER: loads every kernel up front
+#                     so the answer doesn't depend on which kernels this run
+#                     happened to touch. Gives a smaller but portable ceiling
 #   --json            emit machine-readable JSON to stdout
 #   --keep            don't delete per-run logs
 set -uo pipefail
@@ -32,7 +35,7 @@ set -uo pipefail
 die() { echo "ctxprobe: $*" >&2; exit 1; }
 
 MODEL=""; MIN=2048; MAX=""; STEP=256; KV="q8_0"; PARALLEL=1; NGL=999
-LIST=""; FILL=95; PORT=6099; OUT="./ctxprobe-out"; JSON=0; KEEP=0
+LIST=""; FILL=95; PORT=6099; OUT="./ctxprobe-out"; JSON=0; KEEP=0; EAGER=0
 EXTRA=()   # expanded as ${EXTRA[@]+...} so bash 3.2 tolerates it empty under set -u
 
 val() {  # val <flag> <value?> — reject a missing or non-numeric argument
@@ -56,6 +59,7 @@ while [[ $# -gt 0 ]]; do
     --fill) FILL=$(val "$1" "${2:-}") || exit 1; shift 2 ;;
     --port) PORT=$(val "$1" "${2:-}") || exit 1; shift 2 ;;
     --out) [[ -n "${2:-}" ]] || die "--out needs a value"; OUT="$2"; shift 2 ;;
+    --eager) EAGER=1; shift ;;
     --json) JSON=1; shift ;;
     --keep) KEEP=1; shift ;;
     -h|--help) sed -n '2,/^set /p' "$0" | grep '^#' | sed 's/^# \{0,1\}//'; exit 0 ;;
@@ -106,6 +110,7 @@ GPU_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader | head -1)
 # Lazy vs eager module loading decides when a kernel's code is pulled into VRAM,
 # which moves the ceiling. Two machines set differently give different answers,
 # so record it rather than leaving the discrepancy unexplained.
+(( EAGER )) && export CUDA_MODULE_LOADING=EAGER
 CUDA_LOADING="${CUDA_MODULE_LOADING:-LAZY (default)}"
 
 # Trained context length, so --max defaults to something the model supports.
@@ -273,13 +278,17 @@ for i, rung in enumerate(rungs):
         if (usage.get("completion_tokens") or 0) == 0:
             print(f"silent {used}"); break
     except Exception:
-        print(f"fail {n or rung}"); break
+        print(f"fail {n or rung}"); break   # the rung that died is the useful part
 else:
     print(f"ok {used}")
 LADDER
 )
   local filled=""
-  case "$ok" in ok\ *) filled="${ok#ok }" ;; silent\ *) filled="${ok#silent }" ;; esac
+  case "$ok" in
+    ok\ *)     filled="${ok#ok }" ;;
+    silent\ *) filled="${ok#silent }" ;;
+    fail\ *)   filled="died@${ok#fail }" ;;   # which rung killed it
+  esac
 
   local u; u=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits | head -1)
   (( u > peak )) && peak=$u
@@ -319,10 +328,12 @@ if (( JSON == 0 )); then
   echo "  vram      : ${VRAM_TOTAL} MiB reported by nvidia-smi, ${VRAM_BASE} MiB already in use"
   if [[ -n "$VRAM_USABLE" ]]; then
   echo "              ${VRAM_USABLE} MiB actually allocatable ($(( VRAM_TOTAL - VRAM_USABLE )) MiB is driver reserve)"
-  # free < allocatable means something else is holding VRAM; that is the real
-  # budget for this run, and quoting only the total would overstate it.
-  (( VRAM_USABLE - VRAM_FREE > 64 )) && \
-  echo "              ${VRAM_FREE} MiB free right now — $(( VRAM_USABLE - VRAM_FREE )) MiB held by something else"
+  # Report what other processes hold using nvidia-smi's figure, not the free
+  # value from cudaMemGetInfo: reading that requires creating a CUDA context,
+  # which itself reserves a few hundred MiB and would be counted as somebody
+  # else's usage even though it is released before the run starts.
+  (( VRAM_BASE > 64 )) && \
+  echo "              $(( VRAM_USABLE - VRAM_BASE )) MiB free for this run (${VRAM_BASE} MiB held by other processes)"
   else
   echo "              (no torch found, so the real allocatable total is unknown —"
   echo "               nvidia-smi's figure above includes driver reserve. Set"
@@ -392,7 +403,7 @@ fi
 if (( JSON == 1 )); then
   python3 - "$MODEL" "$GPU_NAME" "$BEST" "$BEST_PEAK" "$BEST_PRE" "$BEST_GEN" \
            "$KV" "$PARALLEL" "$VRAM_TOTAL" "${VRAM_USABLE:-}" "$NGL" "$FILL" \
-           "$CUDA_LOADING" "${VRAM_FREE:-}" <<'PY'
+           "$CUDA_LOADING" "$VRAM_BASE" <<'PY'
 import json, os, sys
 (m, gpu, best, peak, pre, gen, kv, par, total, usable,
  ngl, fill, cuda_loading, free) = sys.argv[1:15]
@@ -410,7 +421,7 @@ print(json.dumps({
     "cuda_module_loading": cuda_loading,
     "vram_total_mib": int(total),
     "vram_allocatable_mib": int(usable) if usable else None,
-    "vram_free_at_start_mib": int(free) if free else None,
+    "vram_held_by_others_mib": int(free) if free else None,
 }, indent=2))
 PY
 else
@@ -427,7 +438,14 @@ else
     echo "  llama-server -m $MODEL -ngl $NGL -c $SAFE \\"
     echo "    --cache-type-k $KV --cache-type-v $KV --parallel $PARALLEL${EXTRA[*]:+ ${EXTRA[*]}}"
     echo
-    echo "Use -c $BEST only if this GPU is doing nothing else." 
+    echo "Use -c $BEST only if this GPU is doing nothing else."
+    if (( EAGER == 0 )); then
+      echo
+      echo "This number assumes the kernels this run happened to touch are all"
+      echo "your workload will ever touch. Re-run with --eager for a ceiling that"
+      echo "holds regardless — smaller, but a property of the config rather than"
+      echo "of the test."
+    fi 
   else
     echo "No context size passed."
   fi
