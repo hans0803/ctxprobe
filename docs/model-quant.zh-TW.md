@@ -22,7 +22,7 @@
 
 **溢出 57% 的層，速度只剩五分之一。**
 「裝得下」是首要條件；品質是在「裝得下的範圍內」才去優化的東西。
-完整實測見 [results](../results/rtx5060ti-16gb-qwen3.6-27b.zh-TW.md)。
+細節、以及什麼時候溢出反而是對的選擇，見 [spill-cost.zh-TW.md](spill-cost.zh-TW.md)。
 
 ## 看懂那些名字
 

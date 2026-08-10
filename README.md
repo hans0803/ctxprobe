@@ -78,6 +78,8 @@ Two settings decide most of the outcome on a single card:
   that *fits entirely* beats a better one that spills.
 - **[KV cache: why q8_0](docs/kv-cache-quant.md)** — the highest-leverage
   setting for long context. Worth 72% more context here, for one flag.
+- **[What it costs when it doesn't fit](docs/spill-cost.md)** — measured: 5×
+  slower for spilling 57% of the layers, and how to test a card you don't own.
 
 Then [gotchas.md](docs/gotchas.md) for what silently eats VRAM, and
 [results/](results/) for measured configurations.

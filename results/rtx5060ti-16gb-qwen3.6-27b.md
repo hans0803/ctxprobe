@@ -155,14 +155,12 @@ Verified afterwards: the process loads only `libEGL_mesa` + `libgallium`, and
 
 ## What the 8GB card would do
 
-The 5060 Ti ships as 8GB and 16GB variants off the same GB206 die — identical
-4608 CUDA cores, identical clocks, identical 128-bit GDDR7 at 448 GB/s. Capacity
-is the only difference on the spec sheet, so constraining the 16GB card to an 8GB
-budget produces speed numbers that transfer to the real 8GB part.
+The 5060 Ti ships as 8GB and 16GB off the same GB206 die, with the same cores,
+clocks and 448 GB/s bandwidth — so holding 7899 MiB here reproduces the 8GB
+part's budget. Why that substitution is valid and how to repeat it:
+[spill-cost.md](../docs/spill-cost.md).
 
-Method: hold 7899 MiB with a separate CUDA process, leaving 7799 MiB free. A real
-8GB card's allocatable budget is roughly 7800 MiB — its driver reserve is smaller
-than this card's 462 MiB, so this is the conservative side of the estimate.
+Held to 7799 MiB free, context 4096:
 
 | `-ngl` | Layers on GPU | Result | Prefill | Generate |
 |---|---|---|---|---|
@@ -171,7 +169,7 @@ than this card's 462 MiB, so this is the conservative side of the estimate.
 | **28** | 28 of 65 | PASS | 391.21 tok/s | **5.11 tok/s** |
 | 24 | 24 of 65 | PASS | 367.60 tok/s | 4.63 tok/s |
 
-Against the same model fully resident on the 16GB card, at comparable context:
+Against the same model fully resident on the 16GB card:
 
 | | 16GB — all 65 layers | 8GB — 28 of 65 layers |
 |---|---|---|
@@ -179,18 +177,8 @@ Against the same model fully resident on the 16GB card, at comparable context:
 | Prefill | ~900 tok/s | 391 tok/s |
 | Max context | 34,816 | 4,096 tested |
 
-**Spilling 37 of 65 layers to system RAM costs roughly 80% of generation speed.**
-Every token has to cross PCIe to reach the layers living in DDR4, and no amount
-of CPU is going to make that competitive with VRAM.
-
-This is the concrete case for the rule in
-[model-quant.md](../docs/model-quant.md): the largest quant that fits *entirely*
-beats a better one that spills. On an 8GB card, the answer for a 27B is not a
-smaller quant — `IQ3_XXS` is still 11.99 GB and would not fit either. It is a
-smaller model.
-
-Note the peak VRAM figures in this section include the 7899 MiB held by the
-simulating process, so subtract that to get the model's own usage.
+A 27B at IQ4_XS does not fit an 8GB card in any usable sense. Peak VRAM figures
+above include the 7899 MiB held by the simulating process.
 
 ## VRAM behaviour during inference
 

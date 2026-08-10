@@ -23,8 +23,8 @@ Measured, same card, same model, same quant — only how much of it fits changes
 | 28 of 65 layers (rest in DDR4) | **5.11 tok/s** |
 
 **Five times slower for spilling 57% of the layers.** Fitting is the primary
-constraint; quality is what you optimise *within* what fits. Full run in
-[results](../results/rtx5060ti-16gb-qwen3.6-27b.md).
+constraint; quality is what you optimise *within* what fits. Details, and when
+spilling is nonetheless the right call, in [spill-cost.md](spill-cost.md).
 
 ## Reading the names
 

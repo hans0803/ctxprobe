@@ -76,6 +76,8 @@ RTX 5060 Ti（16 GB）、Qwen3.6-27B-IQ4_XS + q8_0 KV 的實測：
   「**完整**裝得下的最大量化」勝過「會溢出的更好量化」。
 - **[KV cache：為什麼用 q8_0](docs/kv-cache-quant.zh-TW.md)** ——
   長 context 上槓桿最大的設定。在這裡，一個參數換到多 72% 的 context。
+- **[裝不下的時候，代價是什麼](docs/spill-cost.zh-TW.md)** —— 實測：
+  溢出 57% 的層會慢五倍，以及怎麼量一張你沒有的顯卡。
 
 接著看 [gotchas.zh-TW.md](docs/gotchas.zh-TW.md) 了解什麼會悄悄吃掉顯存，
 以及 [results/](results/) 裡的實測配置。
