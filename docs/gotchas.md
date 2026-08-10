@@ -32,6 +32,10 @@ load_model: initializing, n_slots = 4, n_ctx_slot = 8192
 Check `n_slots` in the startup log. For single-user testing, `--parallel 1` is
 free context — it took our test card from 4,096 to 16,384 with no other change.
 
+This has changed across llama.cpp versions — some treat `-c` as the total and
+divide it among slots. Don't trust this page over your own startup log: read
+`n_ctx_slot` and `n_slots` and multiply.
+
 ## 3. `n_ctx` is padded to 256
 
 ```c
@@ -44,7 +48,9 @@ skips three testable sizes each step. Confirm with `n_ctx_slot` in the log.
 
 ## 4. A short prompt does not qualify a context size
 
-The big one. Prefill compute buffers scale with prompt length, so this happens:
+The big one. A longer prompt instantiates CUDA kernels a short one never
+touches, and loading one for the first time needs device memory that a
+nearly-full card doesn't have. So this happens:
 
 | Context | Loads | Short prompt | Full-size prompt |
 |---|---|---|---|

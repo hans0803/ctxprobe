@@ -55,9 +55,25 @@ Real numbers from an RTX 5060 Ti (16 GB), Qwen3.6-27B-IQ4_XS + q8_0 KV:
 | 34816 | yes | 25.99 tok/s | **works** |
 | 35072 | yes | 25.98 tok/s | **CUDA OOM, server dies** |
 
-35072 loads fine and generates at full speed. Then a realistic prompt kills it.
-**Prefill compute buffers scale with prompt length**, and no load-time estimate
-models that — so anything validated with a short prompt reports a false pass.
+35072 loads fine and generates at full speed. Then a realistic prompt kills it:
+
+```
+launch_mul_mat_q at mmq.cuh:1375
+cudaFuncSetAttribute(mul_mat_q<type, J, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, ...)
+CUDA error: out of memory
+```
+
+**A long prompt reaches CUDA kernels a short one never touches.** llama.cpp's
+quantized matmul is templated on batch shape, so a larger prefill instantiates a
+different `mul_mat_q` variant — and under CUDA's lazy module loading (the default
+since CUDA 12), touching a kernel for the first time loads its code into device
+memory. With VRAM nearly exhausted, that load is what fails.
+
+Note what this is *not*: allocation growing during inference. Sampled every
+50 ms across a full prefill and decode, VRAM never moved off 15845 MiB. The run
+simply needs a few hundred KiB it doesn't have, at a moment no load-time
+estimate can predict — which is why anything validated with a short prompt
+reports a false pass.
 
 `PASS` therefore means the run survived a prompt filling **95% of the window**
 and still emitted tokens. That percentage is measured, not estimated: the length

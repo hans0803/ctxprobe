@@ -32,6 +32,9 @@ load_model: initializing, n_slots = 4, n_ctx_slot = 8192
 檢查啟動 log 裡的 `n_slots`。單人測試的話，`--parallel 1` 等於免費的 context ——
 在我們的測試卡上，光這一項就從 4,096 變成 16,384，其他什麼都沒動。
 
+這個行為在 llama.cpp 不同版本間改過 —— 有些版本把 `-c` 當成總量再分給各 slot。
+不要相信這一頁勝過你自己的啟動 log：去讀 `n_ctx_slot` 和 `n_slots` 再相乘。
+
 ## 3. `n_ctx` 會被對齊到 256
 
 ```c
@@ -44,7 +47,9 @@ cparams.n_ctx = GGML_PAD(cparams.n_ctx, 256);
 
 ## 4. 短 prompt 無法認證一個 context 大小
 
-這是最大的一個。prefill 的 compute buffer 會隨 prompt 長度成長，於是會發生這種事：
+這是最大的一個。較長的 prompt 會實例化短 prompt 從來碰不到的 CUDA kernel，
+而第一次載入某個 kernel 需要 device memory —— 一張幾乎滿載的卡拿不出來。
+於是會發生這種事：
 
 | Context | 載入 | 短 prompt | 真實長度的 prompt |
 |---|---|---|---|

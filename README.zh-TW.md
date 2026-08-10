@@ -54,9 +54,25 @@ RTX 5060 Ti（16 GB）、Qwen3.6-27B-IQ4_XS + q8_0 KV 的實測：
 | 34816 | 成功 | 25.99 tok/s | **正常運作** |
 | 35072 | 成功 | 25.98 tok/s | **CUDA OOM，服務崩潰** |
 
-35072 載入完全正常、生成速度也是滿的。然後一個真實長度的 prompt 就殺了它。
-**prefill 的 compute buffer 會隨 prompt 長度成長**，而載入期的估算模型不包含這一項 ——
-所以任何只用短 prompt 驗證的方法，都會回報假的通過。
+35072 載入完全正常、生成速度也是滿的。然後一個真實長度的 prompt 就殺了它：
+
+```
+launch_mul_mat_q at mmq.cuh:1375
+cudaFuncSetAttribute(mul_mat_q<type, J, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, ...)
+CUDA error: out of memory
+```
+
+**長 prompt 會用到短 prompt 從來碰不到的 CUDA kernel。**
+llama.cpp 的量化矩陣乘法是以 batch 形狀作為模板參數的，
+所以較大的 prefill 會實例化另一個 `mul_mat_q` variant ——
+而在 CUDA 的 lazy module loading（CUDA 12 之後的預設）之下，
+第一次觸碰某個 kernel 才會把它的程式碼載入 device memory。
+顯存見底時，失敗的就是這個載入。
+
+注意這**不是**「推論過程中配置量成長」。
+以 50 ms 為間隔對完整的 prefill 與 decode 取樣，顯存從頭到尾都停在 15845 MiB。
+它只是在某個載入期估算無法預測的時刻，
+差那幾百 KiB 而已 —— 這正是為什麼任何用短 prompt 驗證的方法都會回報假的通過。
 
 因此 `PASS` 的定義是：撐過一個**灌滿視窗 95%** 的 prompt，而且真的吐得出 token。
 這個百分比是量出來的、不是估的 —— 長度透過伺服器自己的

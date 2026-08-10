@@ -3,9 +3,10 @@
 #
 # Estimators tell you a context size should fit. ctxprobe proves it runs:
 # every candidate is booted for real, given a short prompt, and then given a
-# prompt that fills most of the window — because prefill compute buffers grow
-# with prompt length, a config can load fine, decode a short prompt at full
-# speed, and still CUDA-OOM on a real one.
+# prompt that fills most of the window. A larger prefill instantiates CUDA
+# kernels a short prompt never touches, and loading one for the first time needs
+# device memory a nearly-full card doesn't have — so a config can load fine,
+# decode a short prompt at full speed, and still CUDA-OOM on a real one.
 #
 # Usage:
 #   ctxprobe MODEL.gguf [options] [-- extra llama-server args]
@@ -32,20 +33,29 @@ die() { echo "ctxprobe: $*" >&2; exit 1; }
 
 MODEL=""; MIN=2048; MAX=""; STEP=256; KV="q8_0"; PARALLEL=1; NGL=999
 LIST=""; FILL=95; PORT=6099; OUT="./ctxprobe-out"; JSON=0; KEEP=0
-EXTRA=()
+EXTRA=()   # expanded as ${EXTRA[@]+...} so bash 3.2 tolerates it empty under set -u
+
+val() {  # val <flag> <value?> — reject a missing or non-numeric argument
+  [[ -n "${2:-}" ]] || die "$1 needs a value"
+  case "$1" in
+    --kv) ;;
+    *) [[ "$2" =~ ^[0-9]+$ ]] || die "$1 needs a number, got: $2" ;;
+  esac
+  printf '%s' "$2"
+}
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --min) MIN="$2"; shift 2 ;;
-    --max) MAX="$2"; shift 2 ;;
-    --step) STEP="$2"; shift 2 ;;
-    --kv) KV="$2"; shift 2 ;;
-    --parallel) PARALLEL="$2"; shift 2 ;;
-    --ngl) NGL="$2"; shift 2 ;;
-    --list) LIST="$2"; shift 2 ;;
-    --fill) FILL="$2"; shift 2 ;;
-    --port) PORT="$2"; shift 2 ;;
-    --out) OUT="$2"; shift 2 ;;
+    --min) MIN=$(val "$1" "${2:-}") || exit 1; shift 2 ;;
+    --max) MAX=$(val "$1" "${2:-}") || exit 1; shift 2 ;;
+    --step) STEP=$(val "$1" "${2:-}") || exit 1; shift 2 ;;
+    --kv) KV=$(val "$1" "${2:-}") || exit 1; shift 2 ;;
+    --parallel) PARALLEL=$(val "$1" "${2:-}") || exit 1; shift 2 ;;
+    --ngl) NGL=$(val "$1" "${2:-}") || exit 1; shift 2 ;;
+    --list) [[ -n "${2:-}" ]] || die "--list needs a value"; LIST="$2"; shift 2 ;;
+    --fill) FILL=$(val "$1" "${2:-}") || exit 1; shift 2 ;;
+    --port) PORT=$(val "$1" "${2:-}") || exit 1; shift 2 ;;
+    --out) [[ -n "${2:-}" ]] || die "--out needs a value"; OUT="$2"; shift 2 ;;
     --json) JSON=1; shift ;;
     --keep) KEEP=1; shift ;;
     -h|--help) sed -n '2,/^set /p' "$0" | grep '^#' | sed 's/^# \{0,1\}//'; exit 0 ;;
@@ -128,13 +138,27 @@ MIN=$(round_step "$MIN"); MAX=$(round_step "$MAX")
 (( MIN >= STEP )) || MIN=$STEP
 (( MAX > MIN )) || die "--max ($MAX) must exceed --min ($MIN)"
 
-# The bracket in [l]lama-server stops the pattern from matching this script's
-# own command line — otherwise pkill takes out the caller along with the server.
-cleanup() { pkill -f "[l]lama-server.*--port $PORT" 2>/dev/null; sleep 2; }
+# Only ever kill the server this script started. Matching on the port would also
+# take out a server the user is running themselves, and the trap fires on Ctrl-C.
+CURRENT_SRV=""
+cleanup() {
+  [[ -n "$CURRENT_SRV" ]] || return 0
+  kill "$CURRENT_SRV" 2>/dev/null
+  for _ in $(seq 1 15); do kill -0 "$CURRENT_SRV" 2>/dev/null || break; sleep 1; done
+  kill -9 "$CURRENT_SRV" 2>/dev/null
+  CURRENT_SRV=""
+  sleep 1
+}
 trap cleanup EXIT INT TERM
 
+# Refuse to start rather than fight over a port something else owns.
+if (exec 3<>"/dev/tcp/127.0.0.1/$PORT") 2>/dev/null; then
+  exec 3<&-
+  die "port $PORT is already in use — pass --port to choose another"
+fi
+
 RESULTS_TSV="$OUT/results.tsv"
-: > "$RESULTS_TSV"
+printf 'context\tresult\tpeak_vram_mib\tprefill_tps\tgenerate_tps\tprompt_tokens\n' > "$RESULTS_TSV"
 
 # ------------------------------------------------------------------ one trial
 # Boots the server at $1 tokens and returns 0 only if it survives both prompts.
@@ -148,8 +172,9 @@ try_ctx() {
     -m "$MODEL" --host 127.0.0.1 --port "$PORT" \
     -ngl "$NGL" -c "$ctx" --parallel "$PARALLEL" \
     --cache-type-k "$KV" --cache-type-v "$KV" \
-    "${EXTRA[@]}" > "$log" 2>&1 &
+    ${EXTRA[@]+"${EXTRA[@]}"} > "$log" 2>&1 &
   local srv=$!
+  CURRENT_SRV=$srv
 
   local peak=0 ready=no
   for _ in $(seq 1 300); do
@@ -161,7 +186,7 @@ try_ctx() {
   done
 
   if [[ "$ready" != yes ]]; then
-    kill $srv 2>/dev/null
+    cleanup
     echo -e "LOAD_FAIL\t$peak\t\t"; return 1
   fi
 
@@ -172,7 +197,7 @@ try_ctx() {
     >/dev/null 2>&1
 
   if grep -qiE "CUDA error|ggml_abort|out of memory" "$log"; then
-    kill $srv 2>/dev/null
+    cleanup
     echo -e "DECODE_OOM\t$peak\t\t"; return 1
   fi
 
@@ -180,6 +205,7 @@ try_ctx() {
   # window is measured with the server's own tokenizer rather than guessed at,
   # so "95%" really is 95% — and only a handful of tokens is asked back, because
   # what's being proven is that prefill at that depth survives and still speaks.
+  # Depth is what matters: it decides which kernels get instantiated.
   local ok
   ok=$(python3 - "$ctx" "$PORT" "$FILL" <<'PY'
 import json, random, sys, urllib.request
@@ -235,13 +261,13 @@ try:
     usage = r.get("usage") or {}
     used = usage.get("prompt_tokens") or n or 0
     # Surviving prefill isn't enough: it has to actually emit a token.
-    print(f"ok {used}" if (usage.get("completion_tokens") or 0) > 0 else f"fail {used} silent")
+    print(f"ok {used}" if (usage.get("completion_tokens") or 0) > 0 else f"silent {used}")
 except Exception:
     print("fail")
 PY
 )
   local filled=""
-  [[ "$ok" == ok\ * ]] && filled="${ok#ok }"
+  case "$ok" in ok\ *) filled="${ok#ok }" ;; silent\ *) filled="${ok#silent }" ;; esac
 
   local u; u=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits | head -1)
   (( u > peak )) && peak=$u
@@ -257,15 +283,22 @@ PY
   gen=$(grep 'eval time' "$log" | grep -v 'prompt eval' | tail -1 \
         | grep -oE '[0-9.]+ tokens per second' | grep -oE '^[0-9.]+')
 
-  kill $srv 2>/dev/null; sleep 2
+  cleanup
 
+  # A server that survives but emits nothing is not out of memory — usually it's
+  # a thinking model that spent the whole budget reasoning (see gotchas.md).
+  # Reporting that as LONG_OOM sends people hunting for a memory problem.
+  if [[ "$ok" == silent\ * ]] && ! grep -qiE "CUDA error|ggml_abort|out of memory" "$log"; then
+    echo -e "SILENT\t$peak\t${pre:-}\t${gen:-}\t${filled:-}"; return 1
+  fi
   if [[ "$ok" != ok\ * ]] || grep -qiE "CUDA error|ggml_abort|out of memory" "$log"; then
     echo -e "LONG_OOM\t$peak\t${pre:-}\t${gen:-}\t${filled:-}"; return 1
   fi
   echo -e "PASS\t$peak\t${pre:-}\t${gen:-}\t${filled:-}"; return 0
 }
 
-record() { printf '%s\t%s\n' "$1" "$2" >> "$RESULTS_TSV"; }
+record() { printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+  "$1" "$2" "${3:-}" "${4:-}" "${5:-}" "${6:-}" >> "$RESULTS_TSV"; }
 
 if (( JSON == 0 )); then
   echo "ctxprobe"
@@ -291,7 +324,8 @@ if (( JSON == 0 )); then
 fi
 
 emit() {  # ctx verdict peak prefill gen filled
-  (( JSON == 1 )) && return 0
+  # Even in --json mode, say something: a silent hour looks like a hang.
+  (( JSON == 1 )) && { printf '  %s: %s\n' "$1" "$2" >&2; return 0; }
   printf '%-10s %-11s %-11s %-10s %-10s %s\n' \
     "$1" "$2" "${3:-?}" "${4:-n/a}" "${5:-n/a}" "${6:-—}"
 }
@@ -303,14 +337,14 @@ if [[ -n "$LIST" ]]; then
     c=$(round_step "$c")
     IFS=$'\t' read -r v p pre gen fl < <(try_ctx "$c")
     emit "$c" "$v" "$p" "$pre" "$gen" "$fl"
-    record "$c" "$v"
+    record "$c" "$v" "$p" "$pre" "$gen" "$fl"
     [[ "$v" == PASS ]] && (( c > BEST )) && { BEST=$c; BEST_PRE=$pre; BEST_GEN=$gen; BEST_PEAK=$p; }
   done
 else
   # Binary search. lo is the largest known-good, hi the smallest known-bad.
   lo=0; hi=$(( MAX + STEP ))
   IFS=$'\t' read -r v p pre gen fl < <(try_ctx "$MIN")
-  emit "$MIN" "$v" "$p" "$pre" "$gen" "$fl"; record "$MIN" "$v"
+  emit "$MIN" "$v" "$p" "$pre" "$gen" "$fl"; record "$MIN" "$v" "$p" "$pre" "$gen" "$fl"
   if [[ "$v" != PASS ]]; then
     (( JSON == 0 )) && { echo; echo "Even the minimum ($MIN) does not run. Try a smaller quant or --kv q4_0."; }
     [[ $JSON == 1 ]] && echo "{\"model\":\"$(basename "$MODEL")\",\"max_context\":0}"
@@ -319,7 +353,7 @@ else
   lo=$MIN; BEST=$MIN; BEST_PRE=$pre; BEST_GEN=$gen; BEST_PEAK=$p
 
   IFS=$'\t' read -r v p pre gen fl < <(try_ctx "$MAX")
-  emit "$MAX" "$v" "$p" "$pre" "$gen" "$fl"; record "$MAX" "$v"
+  emit "$MAX" "$v" "$p" "$pre" "$gen" "$fl"; record "$MAX" "$v" "$p" "$pre" "$gen" "$fl"
   if [[ "$v" == PASS ]]; then
     BEST=$MAX; BEST_PRE=$pre; BEST_GEN=$gen; BEST_PEAK=$p
     lo=$MAX; hi=$(( MAX + STEP ))
@@ -330,7 +364,7 @@ else
       (( mid <= lo )) && break
       (( mid >= hi )) && break
       IFS=$'\t' read -r v p pre gen fl < <(try_ctx "$mid")
-      emit "$mid" "$v" "$p" "$pre" "$gen" "$fl"; record "$mid" "$v"
+      emit "$mid" "$v" "$p" "$pre" "$gen" "$fl"; record "$mid" "$v" "$p" "$pre" "$gen" "$fl"
       if [[ "$v" == PASS ]]; then
         lo=$mid; BEST=$mid; BEST_PRE=$pre; BEST_GEN=$gen; BEST_PEAK=$p
       else
@@ -361,12 +395,18 @@ PY
 else
   echo
   if (( BEST > 0 )); then
+    SAFE=$(( BEST - 2 * STEP )); (( SAFE < STEP )) && SAFE=$BEST
     echo "Largest context that actually runs: $BEST tokens"
     echo "  peak VRAM ${BEST_PEAK:-?} MiB | prefill ${BEST_PRE:-?} tok/s | generate ${BEST_GEN:-?} tok/s"
     echo
-    echo "Run it with:"
-    echo "  llama-server -m $MODEL -ngl 999 -c $BEST \\"
+    echo "That is a ceiling, not a recommendation: it passed at ${FILL}% fill with"
+    echo "nothing to spare. Anything else touching the card — a desktop, a second"
+    echo "process — puts it over. For day-to-day use back off a couple of steps:"
+    echo
+    echo "  llama-server -m $MODEL -ngl $NGL -c $SAFE \\"
     echo "    --cache-type-k $KV --cache-type-v $KV --parallel $PARALLEL${EXTRA[*]:+ ${EXTRA[*]}}"
+    echo
+    echo "Use -c $BEST only if this GPU is doing nothing else." 
   else
     echo "No context size passed."
   fi
