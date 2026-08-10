@@ -52,13 +52,16 @@ The big one. A longer prompt instantiates CUDA kernels a short one never
 touches, and loading one for the first time needs device memory that a
 nearly-full card doesn't have. So this happens:
 
-| Context | Loads | Short prompt | Full-size prompt |
+| Context | Loads | 18-token prompt | 64-token prompt |
 |---|---|---|---|
 | 34816 | yes | 25.99 tok/s | works |
 | 35072 | yes | 25.98 tok/s | **CUDA OOM** |
 
 Nothing about the load, the health check, or a small generation distinguishes
-these two. Only a prompt that fills the window does.
+these two. **64 tokens does** — the threshold is far lower than "fill the
+window", which matters because it makes checking cheap. Confirm the mechanism
+with `CUDA_MODULE_LOADING=EAGER`: it loads every kernel up front, turning the
+runtime crash into a startup failure you can't miss.
 
 Related: when the child dies this way it becomes a defunct process, and a
 supervising gateway that only tracks its own state will keep reporting the

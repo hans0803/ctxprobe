@@ -71,9 +71,33 @@ memory. With VRAM nearly exhausted, that load is what fails.
 
 Note what this is *not*: allocation growing during inference. Sampled every
 50 ms across a full prefill and decode, VRAM never moved off 15845 MiB. The run
-simply needs a few hundred KiB it doesn't have, at a moment no load-time
-estimate can predict — which is why anything validated with a short prompt
-reports a false pass.
+simply needs memory to load a kernel it hasn't loaded yet.
+
+Two experiments pin this down. Forcing kernels to load up front turns the
+mysterious runtime crash into a deterministic startup failure:
+
+```
+$ CUDA_MODULE_LOADING=EAGER llama-server ... -c 35072
+allocating 251.53 MiB on device 0: cudaMalloc failed: out of memory
+llama_init_from_model: failed to allocate compute pp buffers
+```
+
+And the lethal prompt is far shorter than "fills the window". Climbing prompt
+lengths against both configs:
+
+| Prompt | 34,816 (passes) | 35,072 (fails) |
+|---|---|---|
+| 16 tokens | ok | ok |
+| 32 tokens | ok | ok |
+| **64 tokens** | ok | **dies** |
+| 2,025 tokens | ok | — |
+
+**64 tokens is enough to separate them.** ctxprobe's own warmup prompt is 18
+tokens, which is exactly why it needed a long prompt to notice — not because
+filling the window matters, but because 18 tokens sits below the threshold where
+a new kernel variant gets instantiated. The prompt ladder exploits this: it
+climbs 64 → 512 → 4096 → full and stops at the first death, so a doomed config
+is rejected in seconds instead of after a 30K-token prefill.
 
 `PASS` therefore means the run survived a prompt filling **95% of the window**
 and still emitted tokens. That percentage is measured, not estimated: the length

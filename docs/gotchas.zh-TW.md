@@ -51,13 +51,16 @@ cparams.n_ctx = GGML_PAD(cparams.n_ctx, 256);
 而第一次載入某個 kernel 需要 device memory —— 一張幾乎滿載的卡拿不出來。
 於是會發生這種事：
 
-| Context | 載入 | 短 prompt | 真實長度的 prompt |
+| Context | 載入 | 18-token prompt | 64-token prompt |
 |---|---|---|---|
 | 34816 | 成功 | 25.99 tok/s | 正常 |
 | 35072 | 成功 | 25.98 tok/s | **CUDA OOM** |
 
 載入過程、健康檢查、小量生成 —— 沒有任何一項能區分這兩者。
-只有「灌滿視窗的 prompt」可以。
+**64 個 token 可以** —— 這個門檻遠低於「灌滿視窗」，
+而這件事很重要，因為它讓檢查變得便宜。
+想確認機制的話用 `CUDA_MODULE_LOADING=EAGER`：
+它會把所有 kernel 提前載入，把執行期崩潰變成你不可能忽略的啟動失敗。
 
 相關的一點：子程序這樣死掉之後會變成殭屍程序（defunct），
 而只追蹤自己狀態的上層 gateway 會繼續回報這個部署是健康的。

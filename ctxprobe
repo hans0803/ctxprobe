@@ -103,6 +103,10 @@ VRAM_INFO=$(read_usable || true)
 VRAM_FREE=${VRAM_INFO% *}; VRAM_USABLE=${VRAM_INFO#* }
 [[ "$VRAM_INFO" == *" "* ]] || { VRAM_FREE=""; VRAM_USABLE=""; }
 GPU_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader | head -1)
+# Lazy vs eager module loading decides when a kernel's code is pulled into VRAM,
+# which moves the ceiling. Two machines set differently give different answers,
+# so record it rather than leaving the discrepancy unexplained.
+CUDA_LOADING="${CUDA_MODULE_LOADING:-LAZY (default)}"
 
 # Trained context length, so --max defaults to something the model supports.
 if [[ -z "$MAX" ]]; then
@@ -201,20 +205,21 @@ try_ctx() {
     echo -e "DECODE_OOM\t$peak\t\t"; return 1
   fi
 
-  # Long prompt: the test that actually qualifies this context size. Filling the
-  # window is measured with the server's own tokenizer rather than guessed at,
-  # so "95%" really is 95% — and only a handful of tokens is asked back, because
-  # what's being proven is that prefill at that depth survives and still speaks.
-  # Depth is what matters: it decides which kernels get instantiated.
+  # Prompt ladder. A larger prefill instantiates CUDA kernel variants a smaller
+  # one never touches, and loading one for the first time needs device memory a
+  # nearly-full card has not got. Measured on this hardware, a config that dies
+  # at 95% fill already dies at 64 tokens — so climbing from short to long and
+  # stopping at the first death costs a fraction of always filling the window,
+  # while still finishing at a full-size prompt for anything that survives.
+  # It also reports *where* it died, which one long prompt cannot.
   local ok
-  ok=$(python3 - "$ctx" "$PORT" "$FILL" <<'PY'
+  ok=$(python3 - "$ctx" "$PORT" "$FILL" <<'LADDER'
 import json, random, sys, urllib.request
 ctx, port, fill = int(sys.argv[1]), sys.argv[2], int(sys.argv[3])
 
 GEN = 8
 target = max(1, int(ctx * fill / 100) - GEN)
-vocab = "alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo lima mike".split()
-rnd = random.Random(ctx)
+vocab = "alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo lima".split()
 
 def post(path, payload, timeout=900):
     req = urllib.request.Request(f"http://127.0.0.1:{port}{path}",
@@ -222,11 +227,9 @@ def post(path, payload, timeout=900):
                                  headers={"content-type": "application/json"})
     return json.load(urllib.request.urlopen(req, timeout=timeout))
 
-def make(n): return " ".join(rnd.choice(vocab) for _ in range(max(1, n)))
-
 def count(text):
     # input_tokens includes the chat template wrapper; /tokenize does not, and
-    # that wrapper is exactly what tips a near-full prompt over the limit.
+    # that wrapper is what tips a near-full prompt over the limit.
     msgs = [{"role": "user", "content": text}]
     try:
         r = post("/v1/chat/completions/input_tokens", {"messages": msgs}, timeout=120)
@@ -241,30 +244,39 @@ def count(text):
     except Exception:
         return None
 
-words, text, n = max(1, target // 2), None, None
-for _ in range(8):
-    text = make(words)
-    n = count(text)
-    if n is None:                      # no tokenizer endpoint — fall back to an estimate
-        text, n = make(int(target / 1.5)), None
-        break
-    if target * 0.98 <= n <= target:
-        break
-    words = max(1, int(words * target / max(n, 1)))
-# Overshooting gets the request rejected, which is not the failure we're testing for.
-while n is not None and n > target and words > 1:
-    words = max(1, int(words * 0.97)); text = make(words); n = count(text)
+def build(want, seed):
+    rnd = random.Random(seed)
+    words, text, n = max(1, want // 2), "", None
+    for _ in range(8):
+        text = " ".join(rnd.choice(vocab) for _ in range(words))
+        n = count(text)
+        if n is None:
+            return " ".join(rnd.choice(vocab) for _ in range(max(1, int(want / 1.5)))), None
+        if want * 0.97 <= n <= want:
+            break
+        words = max(1, int(words * want / max(n, 1)))
+    while n is not None and n > want and words > 1:
+        words = max(1, int(words * 0.97))
+        text = " ".join(rnd.choice(vocab) for _ in range(words))
+        n = count(text)
+    return text, n
 
-try:
-    r = post("/v1/chat/completions",
-             {"messages": [{"role": "user", "content": text}], "max_tokens": GEN})
-    usage = r.get("usage") or {}
-    used = usage.get("prompt_tokens") or n or 0
-    # Surviving prefill isn't enough: it has to actually emit a token.
-    print(f"ok {used}" if (usage.get("completion_tokens") or 0) > 0 else f"silent {used}")
-except Exception:
-    print("fail")
-PY
+rungs = [r for r in (64, 512, 4096) if r < target] + [target]
+used = 0
+for i, rung in enumerate(rungs):
+    text, n = build(rung, i)
+    try:
+        r = post("/v1/chat/completions",
+                 {"messages": [{"role": "user", "content": text}], "max_tokens": GEN})
+        usage = r.get("usage") or {}
+        used = usage.get("prompt_tokens") or n or rung
+        if (usage.get("completion_tokens") or 0) == 0:
+            print(f"silent {used}"); break
+    except Exception:
+        print(f"fail {n or rung}"); break
+else:
+    print(f"ok {used}")
+LADDER
 )
   local filled=""
   case "$ok" in ok\ *) filled="${ok#ok }" ;; silent\ *) filled="${ok#silent }" ;; esac
@@ -317,6 +329,7 @@ if (( JSON == 0 )); then
   echo "               CTXPROBE_PYTHON to a python that can import torch.)"
   fi
   echo "  kv cache  : $KV | slots: $PARALLEL | step: $STEP | long prompt fills ${FILL}%"
+  echo "  cuda      : CUDA_MODULE_LOADING=$CUDA_LOADING | -ngl $NGL"
   echo
   printf '%-10s %-11s %-11s %-10s %-10s %s\n' \
     CONTEXT RESULT PEAK_VRAM PREFILL GENERATE FILLED
@@ -378,18 +391,26 @@ fi
 
 if (( JSON == 1 )); then
   python3 - "$MODEL" "$GPU_NAME" "$BEST" "$BEST_PEAK" "$BEST_PRE" "$BEST_GEN" \
-           "$KV" "$PARALLEL" "$VRAM_TOTAL" "${VRAM_USABLE:-}" <<'PY'
+           "$KV" "$PARALLEL" "$VRAM_TOTAL" "${VRAM_USABLE:-}" "$NGL" "$FILL" \
+           "$CUDA_LOADING" "${VRAM_FREE:-}" <<'PY'
 import json, os, sys
-m, gpu, best, peak, pre, gen, kv, par, total, usable = sys.argv[1:11]
+(m, gpu, best, peak, pre, gen, kv, par, total, usable,
+ ngl, fill, cuda_loading, free) = sys.argv[1:15]
 print(json.dumps({
+    # Bump when the shape of this object changes, so collected results stay
+    # interpretable once several machines have contributed.
+    "schema": 1,
     "model": os.path.basename(m), "gpu": gpu,
     "max_context": int(best),
     "peak_vram_mib": int(peak) if peak else None,
     "prefill_tps": float(pre) if pre else None,
     "generate_tps": float(gen) if gen else None,
-    "kv_cache_type": kv, "slots": int(par),
+    "kv_cache_type": kv, "slots": int(par), "n_gpu_layers": int(ngl),
+    "fill_percent": int(fill),
+    "cuda_module_loading": cuda_loading,
     "vram_total_mib": int(total),
     "vram_allocatable_mib": int(usable) if usable else None,
+    "vram_free_at_start_mib": int(free) if free else None,
 }, indent=2))
 PY
 else
@@ -411,7 +432,11 @@ else
     echo "No context size passed."
   fi
   echo
-  echo "PASS means it survived a short prompt AND one filling ${FILL}% of the window."
-  echo "LONG_OOM means the short prompt passed but a realistic one crashed it —"
-  echo "that gap is why load-time estimates alone can't qualify a context size."
+  echo "PASS      cleared every rung: 64, 512, 4096 and ${FILL}% of the window"
+  echo "LONG_OOM  a short prompt was fine but a longer one crashed it — the gap"
+  echo "          that makes load-time estimates insufficient"
+  echo "SILENT    ran without crashing but produced no tokens; usually a thinking"
+  echo "          model spending its budget on reasoning, not a memory problem"
+  echo
+  echo "Per-run data: $RESULTS_TSV"
 fi

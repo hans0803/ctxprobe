@@ -71,8 +71,34 @@ llama.cpp 的量化矩陣乘法是以 batch 形狀作為模板參數的，
 
 注意這**不是**「推論過程中配置量成長」。
 以 50 ms 為間隔對完整的 prefill 與 decode 取樣，顯存從頭到尾都停在 15845 MiB。
-它只是在某個載入期估算無法預測的時刻，
-差那幾百 KiB 而已 —— 這正是為什麼任何用短 prompt 驗證的方法都會回報假的通過。
+它只是需要記憶體去載入一個還沒載入過的 kernel。
+
+有兩個實驗把這件事釘死。強制所有 kernel 在啟動時就載入，
+會把神秘的執行期崩潰變成確定性的載入期失敗：
+
+```
+$ CUDA_MODULE_LOADING=EAGER llama-server ... -c 35072
+allocating 251.53 MiB on device 0: cudaMalloc failed: out of memory
+llama_init_from_model: failed to allocate compute pp buffers
+```
+
+而致命的 prompt 遠比「灌滿視窗」短得多。
+對兩個 config 逐級加長 prompt：
+
+| Prompt | 34,816（通過） | 35,072（失敗） |
+|---|---|---|
+| 16 tokens | ok | ok |
+| 32 tokens | ok | ok |
+| **64 tokens** | ok | **死亡** |
+| 2,025 tokens | ok | — |
+
+**64 個 token 就足以區分兩者。** ctxprobe 自己的暖身 prompt 是 18 tokens，
+這正是它為什麼非得靠長 prompt 才發現問題 ——
+不是因為「灌滿視窗」有什麼特別，而是因為 18 tokens 落在
+「會實例化新 kernel variant」的門檻以下。
+prompt 階梯就是利用這一點：依序爬 64 → 512 → 4096 → 完整長度，
+第一次死亡就停 —— 註定失敗的 config 幾秒內就被淘汰，
+而不是等一次 30K token 的 prefill 跑完。
 
 因此 `PASS` 的定義是：撐過一個**灌滿視窗 95%** 的 prompt，而且真的吐得出 token。
 這個百分比是量出來的、不是估的 —— 長度透過伺服器自己的
