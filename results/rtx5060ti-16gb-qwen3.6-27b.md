@@ -3,6 +3,8 @@
 **English** · [繁體中文](rtx5060ti-16gb-qwen3.6-27b.zh-TW.md)
 
 Full measurement run, 2026-08-10. This is the data the tool was built from.
+Covers both `q8_0` and `f16` KV cache, so the cost of not quantising it is
+visible rather than assumed.
 
 Reproduce the ceiling in six boots:
 
@@ -64,6 +66,43 @@ full-size prompt.
 
 Generation speed is flat at ~26 tok/s across the whole range — context costs
 memory, not throughput, until you hit the wall.
+
+## KV cache: q8_0 vs f16
+
+Same model, same card, only `--cache-type-k/v` changed. Both ceilings found by
+binary search with the window filled to 95%.
+
+| KV type | Max context | Peak VRAM | Prefill | Generate |
+|---|---|---|---|---|
+| `f16` (default) | 20,224 | 15843 MiB | 922.54 tok/s | 26.94 tok/s |
+| **`q8_0`** | **34,816** | 15845 MiB | 858.39 tok/s | 24.62 tok/s |
+
+**Quantising the KV cache bought 72% more context** (14,592 extra tokens) on this
+setup.
+
+The obvious guess is that halving the cache should double the context, and it
+doesn't. Weights are a fixed 15.44 GB that the cache never touches — only the
+leftover ~400 MiB is cache budget, so halving the per-token cost extends that
+leftover rather than the whole window. The bigger the model relative to the card,
+the smaller the multiplier.
+
+The f16 search in full:
+
+| Context | Result | Peak VRAM | Filled |
+|---|---|---|---|
+| 8,192 | PASS | 15081 MiB | 7,733 |
+| 16,384 | PASS | 15601 MiB | 15,424 |
+| 18,432 | PASS | 15731 MiB | 17,287 |
+| 19,456 | PASS | 15795 MiB | 18,324 |
+| 19,968 | PASS | 15827 MiB | 18,897 |
+| **20,224** | **PASS** | 15843 MiB | 19,203 |
+| 20,480 | DECODE_OOM | 15783 MiB | — |
+| 24,576 | LOAD_FAIL | — | — |
+
+Don't read the generation column as "f16 is faster". Those runs sit at 20K
+context against q8_0's 34K, and generation slows as the window fills — at a
+comparable 16,384 the f16 run gave 27.28 tok/s, within noise of the q8_0 figures
+at similar depth. KV type is a memory decision, not a speed one.
 
 ## Prefill vs prompt length
 

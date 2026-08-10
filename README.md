@@ -157,6 +157,7 @@ cards welcome — `--json` output is meant to be pasted straight in.
 | GPU | Model | Quant | KV | Max context | Prefill | Generate |
 |---|---|---|---|---|---|---|
 | RTX 5060 Ti 16GB | Qwen3.6-27B | IQ4_XS | q8_0 | 34,816 | 858 tok/s | 24.6 tok/s |
+| RTX 5060 Ti 16GB | Qwen3.6-27B | IQ4_XS | f16 | 20,224 | 923 tok/s | 26.9 tok/s |
 
 Speeds are measured under a window-filling prompt. Generation is faster on an
 empty window (~26 tok/s here) and decays as context fills — quoting the loaded

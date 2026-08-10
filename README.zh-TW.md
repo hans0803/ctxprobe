@@ -152,6 +152,7 @@ ctxprobe MODEL.gguf [選項] [-- 額外的 llama-server 參數]
 | GPU | 模型 | 量化 | KV | 最大 context | Prefill | 生成 |
 |---|---|---|---|---|---|---|
 | RTX 5060 Ti 16GB | Qwen3.6-27B | IQ4_XS | q8_0 | 34,816 | 858 tok/s | 24.6 tok/s |
+| RTX 5060 Ti 16GB | Qwen3.6-27B | IQ4_XS | f16 | 20,224 | 923 tok/s | 26.9 tok/s |
 
 速度都是在「灌滿視窗的 prompt」之下量的。視窗空的時候生成會更快
 （這張卡約 26 tok/s），並隨 context 填滿而衰減 —— 標示滿載時的數字比較誠實。

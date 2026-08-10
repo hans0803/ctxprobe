@@ -31,14 +31,24 @@ the memory, for the same number of tokens.**
 
 Measured on an RTX 5060 Ti 16GB with Qwen3.6-27B-IQ4_XS:
 
-| KV type | Per 1K tokens | Max context on this card |
+| KV type | Bits per value | Max context on this card |
 |---|---|---|
-| `f16` (default) | ~68 MiB | see [results](../results/rtx5060ti-16gb-qwen3.6-27b.md) |
-| `q8_0` | ~34 MiB | **34,816** |
-| `q4_0` | ~17 MiB | untested here |
+| `f16` (default) | 16 | 20,224 |
+| **`q8_0`** | 8 | **34,816** |
+| `q4_0` | 4 | untested here |
 
-The freed memory converts directly into context. Nothing else about the model
-changes — same weights, same speed.
+Both figures are measured, not estimated — see
+[results](../results/rtx5060ti-16gb-qwen3.6-27b.md).
+
+**That is 72% more context for one flag.** Nothing else about the model changes:
+same weights, same output quality from the weights themselves.
+
+Note it is *not* double, even though the cache is half the size. Weights are a
+fixed cost the cache never touches — on this card 15.44 GB of the 15.85 GB usable
+is model, leaving only ~400 MiB as cache budget. Halving the per-token cost
+stretches that remainder, not the whole window. **The tighter the model fits, the
+smaller the gain** — which is worth knowing before assuming q8_0 will rescue a
+model that barely loads.
 
 ## What it costs
 
