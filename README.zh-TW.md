@@ -67,6 +67,19 @@ RTX 5060 Ti（16 GB）、Qwen3.6-27B-IQ4_XS + q8_0 KV 的實測：
 只要求回傳 8 個 token。要證明的是「在那個深度下 prefill 撐得住、模型還開得了口」，
 而不是它寫得多快。
 
+## 從這裡開始
+
+單卡上，有兩個設定決定了你大部分的結果：
+
+- **[你該下載哪一個量化？](docs/model-quant.zh-TW.md)** ——
+  看懂 `Q4_K_M` / `IQ4_XS` 這些名字，以及最重要的那條規則：
+  「**完整**裝得下的最大量化」勝過「會溢出的更好量化」。
+- **[KV cache：為什麼用 q8_0](docs/kv-cache-quant.zh-TW.md)** ——
+  長 context 上槓桿最大的設定。在這裡，一個參數換到多 72% 的 context。
+
+接著看 [gotchas.zh-TW.md](docs/gotchas.zh-TW.md) 了解什麼會悄悄吃掉顯存，
+以及 [results/](results/) 裡的實測配置。
+
 ## 三件會吃掉你顯存的事
 
 都是踩過坑才知道的；三件事估算器全都看不到。
@@ -95,18 +108,8 @@ cparams.n_ctx = GGML_PAD(cparams.n_ctx, 256);
 所以 `-c 35000` 會被靜靜變成 35072。用 1024 當步進（很自然的習慣）每一階會跳過
 三個可測的點；ctxprobe 預設步進是 256。
 
-另外三個坑 —— thinking 模型回傳空輸出、桌面程序佔住顯卡、
-子程序已死但仍被回報為健康 —— 收在 [docs/gotchas.zh-TW.md](docs/gotchas.zh-TW.md)。
-
-## 入門指南
-
-剛開始接觸？下面這兩個設定決定了你大部分的結果：
-
-- [模型量化：你該下載哪一個？](docs/model-quant.zh-TW.md) ——
-  看懂 `Q4_K_M` / `IQ4_XS` 這些名字，以及為什麼「裝得下的最大量化」
-  勝過「裝不下的更好量化」。
-- [KV cache 量化：為什麼你多半該用 q8_0](docs/kv-cache-quant.zh-TW.md) ——
-  單卡跑長 context 時，槓桿最大的一個設定。
+另外三個坑收在 [gotchas.zh-TW.md](docs/gotchas.zh-TW.md)：
+thinking 模型回傳空輸出、桌面程序佔住顯卡、子程序已死卻仍被回報為健康。
 
 ## 用法
 
@@ -146,16 +149,20 @@ ctxprobe MODEL.gguf [選項] [-- 額外的 llama-server 參數]
 
 ## 實測資料
 
-已測配置放在 [results/](results/)。歡迎補上其他顯卡的資料 ——
-`--json` 的輸出就是設計來直接貼進去的。
-
 | GPU | 模型 | 量化 | KV | 最大 context | Prefill | 生成 |
 |---|---|---|---|---|---|---|
 | RTX 5060 Ti 16GB | Qwen3.6-27B | IQ4_XS | q8_0 | 34,816 | 858 tok/s | 24.6 tok/s |
 | RTX 5060 Ti 16GB | Qwen3.6-27B | IQ4_XS | f16 | 20,224 | 923 tok/s | 26.9 tok/s |
 
-速度都是在「灌滿視窗的 prompt」之下量的。視窗空的時候生成會更快
-（這張卡約 26 tok/s），並隨 context 填滿而衰減 —— 標示滿載時的數字比較誠實。
+這兩行是同一個模型、同一張卡，只差一個參數。完整的實測過程
+（包含騰出顯存後上限怎麼往上跳）在
+[rtx5060ti-16gb-qwen3.6-27b.zh-TW.md](results/rtx5060ti-16gb-qwen3.6-27b.zh-TW.md)。
+
+速度來自「灌滿視窗的 prompt」，所以描述的是滿載視窗而不是空視窗的狀態。
+不要把 f16 那一行讀成「f16 生成比較快」—— 它跑在 20K context 而另一行是 34K，
+生成速度本來就會隨視窗填滿而變慢。
+
+歡迎補上其他顯卡的資料；`--json` 的輸出就是設計來直接貼進去的。
 
 ## 範圍
 

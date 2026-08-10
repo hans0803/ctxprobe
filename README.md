@@ -69,6 +69,19 @@ prompt size that was pushed through.
 Only 8 tokens are requested back. The question is whether prefill at that depth
 survives and the model still speaks, not how fast it writes.
 
+## Start here
+
+Two settings decide most of the outcome on a single card:
+
+- **[Which quant should you download?](docs/model-quant.md)** — reading
+  `Q4_K_M` / `IQ4_XS` names, and the rule that matters most: the biggest quant
+  that *fits entirely* beats a better one that spills.
+- **[KV cache: why q8_0](docs/kv-cache-quant.md)** — the highest-leverage
+  setting for long context. Worth 72% more context here, for one flag.
+
+Then [gotchas.md](docs/gotchas.md) for what silently eats VRAM, and
+[results/](results/) for measured configurations.
+
 ## Three things that will cost you VRAM
 
 Found the hard way; all three are invisible to estimators.
@@ -98,19 +111,9 @@ cparams.n_ctx = GGML_PAD(cparams.n_ctx, 256);
 So `-c 35000` silently becomes 35072. Searching in steps of 1024 (a natural
 habit) skips three testable points every step; ctxprobe's default step is 256.
 
-Three more — thinking models returning empty output, desktop processes squatting
-on the card, defunct children still reported healthy — are in
-[docs/gotchas.md](docs/gotchas.md).
-
-## Guides
-
-New to this? These two settings decide most of your outcome:
-
-- [Model quantisation: which one should you download?](docs/model-quant.md) —
-  reading `Q4_K_M` / `IQ4_XS` names, and why the biggest quant that *fits* beats
-  a better one that doesn't.
-- [KV cache quantisation, and why you probably want q8_0](docs/kv-cache-quant.md)
-  — the single highest-leverage setting for long context on one card.
+Three more are in [gotchas.md](docs/gotchas.md): thinking models returning empty
+output, desktop processes squatting on the card, and dead children still being
+reported healthy.
 
 ## Usage
 
@@ -151,17 +154,21 @@ Without torch everything still works, you just don't get that line.
 
 ## Results
 
-Measured configurations live in [results/](results/). Contributions for other
-cards welcome — `--json` output is meant to be pasted straight in.
-
 | GPU | Model | Quant | KV | Max context | Prefill | Generate |
 |---|---|---|---|---|---|---|
 | RTX 5060 Ti 16GB | Qwen3.6-27B | IQ4_XS | q8_0 | 34,816 | 858 tok/s | 24.6 tok/s |
 | RTX 5060 Ti 16GB | Qwen3.6-27B | IQ4_XS | f16 | 20,224 | 923 tok/s | 26.9 tok/s |
 
-Speeds are measured under a window-filling prompt. Generation is faster on an
-empty window (~26 tok/s here) and decays as context fills — quoting the loaded
-figure keeps it honest.
+Those two rows are the same model on the same card, one flag apart. Full run,
+including how the ceiling moved as VRAM was freed:
+[rtx5060ti-16gb-qwen3.6-27b.md](results/rtx5060ti-16gb-qwen3.6-27b.md).
+
+Speeds come from a window-filling prompt, so they describe a loaded window
+rather than an empty one. Don't read the f16 row as "f16 generates faster" —
+it sits at 20K context against 34K, and generation slows as the window fills.
+
+Contributions for other cards welcome; `--json` output is meant to be pasted
+straight in.
 
 ## Scope
 
