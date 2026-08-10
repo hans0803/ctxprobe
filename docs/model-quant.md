@@ -12,9 +12,19 @@ picking one when you have a single GPU and a fixed amount of VRAM.
 doesn't.**
 
 If any part of the model spills into system RAM, every token has to cross the
-PCIe bus. The slowdown is not subtle — it is commonly 5-10× — and no quality
-gain from a higher precision compensates for it. Fitting is the primary
-constraint; quality is what you optimise *within* what fits.
+PCIe bus. The slowdown is not subtle, and no quality gain from a higher precision
+compensates for it.
+
+Measured, same card, same model, same quant — only how much of it fits changes:
+
+| | Generate |
+|---|---|
+| All 65 layers in VRAM | ~26 tok/s |
+| 28 of 65 layers (rest in DDR4) | **5.11 tok/s** |
+
+**Five times slower for spilling 57% of the layers.** Fitting is the primary
+constraint; quality is what you optimise *within* what fits. Full run in
+[results](../results/rtx5060ti-16gb-qwen3.6-27b.md).
 
 ## Reading the names
 

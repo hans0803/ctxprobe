@@ -72,10 +72,14 @@ mkdir -p "$OUT"
 VRAM_TOTAL=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits | head -1)
 VRAM_BASE=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits | head -1)
 read_usable() {
-  # Must be cudaMemGetInfo's total, which is what CUDA will actually hand out.
+  # Must be cudaMemGetInfo, which is what CUDA will actually hand out.
   # NVML/nvidia-smi report the physical size of the board instead — using those
   # yields a driver reserve of 0 and hides the very gap this is here to expose.
-  local snippet='import torch; print(int(torch.cuda.mem_get_info()[1] / 2**20))'
+  # Reports free as well as total: they diverge whenever something else already
+  # holds memory on the card, and it is free that bounds this run.
+  local snippet='import torch
+f, t = torch.cuda.mem_get_info()
+print(int(f / 2**20), int(t / 2**20))'
   local py
   for py in "${CTXPROBE_PYTHON:-}" python3 \
             "$HOME/miniconda3/envs/"*/bin/python "$HOME/venv/bin/python" ; do
@@ -85,7 +89,9 @@ read_usable() {
   done
   return 1
 }
-VRAM_USABLE=$(read_usable || true)
+VRAM_INFO=$(read_usable || true)
+VRAM_FREE=${VRAM_INFO% *}; VRAM_USABLE=${VRAM_INFO#* }
+[[ "$VRAM_INFO" == *" "* ]] || { VRAM_FREE=""; VRAM_USABLE=""; }
 GPU_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader | head -1)
 
 # Trained context length, so --max defaults to something the model supports.
@@ -268,6 +274,10 @@ if (( JSON == 0 )); then
   echo "  vram      : ${VRAM_TOTAL} MiB reported by nvidia-smi, ${VRAM_BASE} MiB already in use"
   if [[ -n "$VRAM_USABLE" ]]; then
   echo "              ${VRAM_USABLE} MiB actually allocatable ($(( VRAM_TOTAL - VRAM_USABLE )) MiB is driver reserve)"
+  # free < allocatable means something else is holding VRAM; that is the real
+  # budget for this run, and quoting only the total would overstate it.
+  (( VRAM_USABLE - VRAM_FREE > 64 )) && \
+  echo "              ${VRAM_FREE} MiB free right now — $(( VRAM_USABLE - VRAM_FREE )) MiB held by something else"
   else
   echo "              (no torch found, so the real allocatable total is unknown —"
   echo "               nvidia-smi's figure above includes driver reserve. Set"
