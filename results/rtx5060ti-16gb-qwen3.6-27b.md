@@ -56,9 +56,11 @@ prompt, and a short prompt reports ~98 tok/s prefill on this card versus ~900
 tok/s under a real one — an artefact of fixed overhead, not a rate. Prefill is
 only meaningful measured against prompt length, which is the next section.
 
-**34,816 is the ceiling.** 35,072 loads, decodes a short prompt at full speed,
-then CUDA-OOMs on a 30K-token prompt and leaves a defunct process behind. It is
-the single clearest argument for validating with a full-size prompt.
+**34,816 is the ceiling**, re-confirmed with the window filled to 95%
+(32,997 tokens measured through the server's tokenizer). 35,072 loads, decodes a
+short prompt at full speed, then CUDA-OOMs on a real prompt and leaves a defunct
+process behind. It is the single clearest argument for validating with a
+full-size prompt.
 
 Generation speed is flat at ~26 tok/s across the whole range — context costs
 memory, not throughput, until you hit the wall.

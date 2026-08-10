@@ -21,19 +21,19 @@ Real output, RTX 5060 Ti 16GB:
   gpu       : NVIDIA GeForce RTX 5060 Ti
   vram      : 16311 MiB reported by nvidia-smi, 15 MiB already in use
               15849 MiB actually allocatable (462 MiB is driver reserve)
-  kv cache  : q8_0 | slots: 1 | step: 256 | long prompt fills 75%
+  kv cache  : q8_0 | slots: 1 | step: 256 | long prompt fills 95%
 
-CONTEXT    RESULT      PEAK_VRAM   PREFILL    GENERATE
-------------------------------------------------------------
-32768      PASS        15767       907.11     24.46
-36864      DECODE_OOM  15845       n/a        n/a
-34816      PASS        15845       900.82     24.29
-35840      DECODE_OOM  15805       n/a        n/a
-35328      DECODE_OOM  15787       n/a        n/a
-35072      LONG_OOM    15847       88.81      26.41
+CONTEXT    RESULT      PEAK_VRAM   PREFILL    GENERATE   FILLED
+------------------------------------------------------------------------
+32768      PASS        15767       867.97     24.76      31057
+36864      DECODE_OOM  15845       n/a        n/a        —
+34816      PASS        15845       858.39     24.62      32997
+35840      DECODE_OOM  15805       n/a        n/a        —
+35328      DECODE_OOM  15787       n/a        n/a        —
+35072      LONG_OOM    15847       89.48      26.36      —
 
 Largest context that actually runs: 34816 tokens
-  peak VRAM 15845 MiB | prefill 900.82 tok/s | generate 24.29 tok/s
+  peak VRAM 15845 MiB | prefill 858.39 tok/s | generate 24.62 tok/s
 ```
 
 Six boots to bracket the ceiling. Note the last row: 35072 loaded, decoded a
@@ -58,7 +58,16 @@ Real numbers from an RTX 5060 Ti (16 GB), Qwen3.6-27B-IQ4_XS + q8_0 KV:
 35072 loads fine and generates at full speed. Then a realistic prompt kills it.
 **Prefill compute buffers scale with prompt length**, and no load-time estimate
 models that — so anything validated with a short prompt reports a false pass.
-ctxprobe's `PASS` requires surviving a prompt that fills most of the window.
+
+`PASS` therefore means the run survived a prompt filling **95% of the window**
+and still emitted tokens. That percentage is measured, not estimated: the length
+is converged on using the server's own `/v1/chat/completions/input_tokens`
+endpoint, so it accounts for the chat template wrapper — which is exactly what
+tips a near-full prompt over the limit. The `FILLED` column reports the real
+prompt size that was pushed through.
+
+Only 8 tokens are requested back. The question is whether prefill at that depth
+survives and the model still speaks, not how fast it writes.
 
 ## Three things that will cost you VRAM
 
@@ -104,7 +113,8 @@ ctxprobe MODEL.gguf [options] [-- extra llama-server args]
   --kv TYPE      KV cache type: q8_0 (default), f16, q4_0
   --parallel N   server slots (default 1)
   --list "A B C" test these sizes instead of binary-searching
-  --fill PCT     how full the long prompt should be (default 75)
+  --fill PCT     how full the long prompt should be (default 95)
+  --ngl N        layers on GPU (default 999 = all; lower spills to system RAM)
   --json         machine-readable output
   --keep         keep per-run logs
 ```
@@ -136,7 +146,7 @@ cards welcome — `--json` output is meant to be pasted straight in.
 
 | GPU | Model | Quant | KV | Max context | Prefill | Generate |
 |---|---|---|---|---|---|---|
-| RTX 5060 Ti 16GB | Qwen3.6-27B | IQ4_XS | q8_0 | 34,816 | 901 tok/s | 24.3 tok/s |
+| RTX 5060 Ti 16GB | Qwen3.6-27B | IQ4_XS | q8_0 | 34,816 | 858 tok/s | 24.6 tok/s |
 
 Speeds are measured under a window-filling prompt. Generation is faster on an
 empty window (~26 tok/s here) and decays as context fills — quoting the loaded

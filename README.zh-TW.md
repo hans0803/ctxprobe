@@ -21,19 +21,19 @@ RTX 5060 Ti 16GB 的實際輸出：
   gpu       : NVIDIA GeForce RTX 5060 Ti
   vram      : 16311 MiB reported by nvidia-smi, 15 MiB already in use
               15849 MiB actually allocatable (462 MiB is driver reserve)
-  kv cache  : q8_0 | slots: 1 | step: 256 | long prompt fills 75%
+  kv cache  : q8_0 | slots: 1 | step: 256 | long prompt fills 95%
 
-CONTEXT    RESULT      PEAK_VRAM   PREFILL    GENERATE
-------------------------------------------------------------
-32768      PASS        15767       907.11     24.46
-36864      DECODE_OOM  15845       n/a        n/a
-34816      PASS        15845       900.82     24.29
-35840      DECODE_OOM  15805       n/a        n/a
-35328      DECODE_OOM  15787       n/a        n/a
-35072      LONG_OOM    15847       88.81      26.41
+CONTEXT    RESULT      PEAK_VRAM   PREFILL    GENERATE   FILLED
+------------------------------------------------------------------------
+32768      PASS        15767       867.97     24.76      31057
+36864      DECODE_OOM  15845       n/a        n/a        —
+34816      PASS        15845       858.39     24.62      32997
+35840      DECODE_OOM  15805       n/a        n/a        —
+35328      DECODE_OOM  15787       n/a        n/a        —
+35072      LONG_OOM    15847       89.48      26.36      —
 
 Largest context that actually runs: 34816 tokens
-  peak VRAM 15845 MiB | prefill 900.82 tok/s | generate 24.29 tok/s
+  peak VRAM 15845 MiB | prefill 858.39 tok/s | generate 24.62 tok/s
 ```
 
 六次啟動就夾出上限。注意最後一行：35072 **載入成功、短 prompt 也能全速生成**，
@@ -57,7 +57,15 @@ RTX 5060 Ti（16 GB）、Qwen3.6-27B-IQ4_XS + q8_0 KV 的實測：
 35072 載入完全正常、生成速度也是滿的。然後一個真實長度的 prompt 就殺了它。
 **prefill 的 compute buffer 會隨 prompt 長度成長**，而載入期的估算模型不包含這一項 ——
 所以任何只用短 prompt 驗證的方法，都會回報假的通過。
-ctxprobe 的 `PASS` 要求「撐過一個灌滿大半視窗的 prompt」。
+
+因此 `PASS` 的定義是：撐過一個**灌滿視窗 95%** 的 prompt，而且真的吐得出 token。
+這個百分比是量出來的、不是估的 —— 長度透過伺服器自己的
+`/v1/chat/completions/input_tokens` 端點迭代逼近，所以連 chat template 的包裝都算進去了，
+而那層包裝正好就是把「接近滿」的 prompt 推過界的元兇。
+`FILLED` 欄位回報的就是實際灌進去的 prompt 大小。
+
+只要求回傳 8 個 token。要證明的是「在那個深度下 prefill 撐得住、模型還開得了口」，
+而不是它寫得多快。
 
 ## 三件會吃掉你顯存的事
 
@@ -100,9 +108,9 @@ ctxprobe MODEL.gguf [選項] [-- 額外的 llama-server 參數]
   --step N       粒度（預設 256）
   --kv TYPE      KV cache 型別：q8_0（預設）、f16、q4_0
   --parallel N   server slot 數（預設 1）
-  --ngl N        放上 GPU 的層數（預設 999 = 全部）
+  --ngl N        放上 GPU 的層數（預設 999 = 全部；調低會溢出到系統記憶體）
   --list "A B C" 直接測這些數值，不做二分搜尋
-  --fill PCT     長 prompt 要灌多滿（預設 75）
+  --fill PCT     長 prompt 要灌多滿（預設 95，由伺服器 tokenizer 實測）
   --json         機器可讀的輸出
   --keep         保留每一輪的 log
 ```
@@ -133,7 +141,7 @@ ctxprobe MODEL.gguf [選項] [-- 額外的 llama-server 參數]
 
 | GPU | 模型 | 量化 | KV | 最大 context | Prefill | 生成 |
 |---|---|---|---|---|---|---|
-| RTX 5060 Ti 16GB | Qwen3.6-27B | IQ4_XS | q8_0 | 34,816 | 901 tok/s | 24.3 tok/s |
+| RTX 5060 Ti 16GB | Qwen3.6-27B | IQ4_XS | q8_0 | 34,816 | 858 tok/s | 24.6 tok/s |
 
 速度都是在「灌滿視窗的 prompt」之下量的。視窗空的時候生成會更快
 （這張卡約 26 tok/s），並隨 context 填滿而衰減 —— 標示滿載時的數字比較誠實。

@@ -20,7 +20,8 @@
 #                     system RAM — useful for measuring what overflow costs,
 #                     but then a PASS no longer means "ran entirely on the GPU"
 #   --list "A B C"    test these sizes instead of binary-searching
-#   --fill PCT        how full the long prompt should be, 0-100 (default 75)
+#   --fill PCT        how full the long prompt should be, 0-100 (default 95).
+#                     Measured with the server tokenizer, so it is the real figure
 #   --port N          port for the probe server (default 6099)
 #   --out DIR         where logs go (default ./ctxprobe-out)
 #   --json            emit machine-readable JSON to stdout
@@ -29,8 +30,8 @@ set -uo pipefail
 
 die() { echo "ctxprobe: $*" >&2; exit 1; }
 
-MODEL=""; MIN=2048; MAX=""; STEP=256; KV="q8_0"; PARALLEL=1
-LIST=""; FILL=75; PORT=6099; OUT="./ctxprobe-out"; JSON=0; KEEP=0
+MODEL=""; MIN=2048; MAX=""; STEP=256; KV="q8_0"; PARALLEL=1; NGL=999
+LIST=""; FILL=95; PORT=6099; OUT="./ctxprobe-out"; JSON=0; KEEP=0
 EXTRA=()
 
 while [[ $# -gt 0 ]]; do
@@ -40,6 +41,7 @@ while [[ $# -gt 0 ]]; do
     --step) STEP="$2"; shift 2 ;;
     --kv) KV="$2"; shift 2 ;;
     --parallel) PARALLEL="$2"; shift 2 ;;
+    --ngl) NGL="$2"; shift 2 ;;
     --list) LIST="$2"; shift 2 ;;
     --fill) FILL="$2"; shift 2 ;;
     --port) PORT="$2"; shift 2 ;;
@@ -130,7 +132,7 @@ RESULTS_TSV="$OUT/results.tsv"
 
 # ------------------------------------------------------------------ one trial
 # Boots the server at $1 tokens and returns 0 only if it survives both prompts.
-# Echoes: verdict<TAB>peak_vram<TAB>prefill_tps<TAB>gen_tps
+# Echoes: verdict<TAB>peak_vram<TAB>prefill_tps<TAB>gen_tps<TAB>prompt_tokens
 try_ctx() {
   local ctx="$1"
   local log="$OUT/ctx${ctx}.log"
@@ -138,7 +140,7 @@ try_ctx() {
 
   CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}" "$LLAMA_BIN" \
     -m "$MODEL" --host 127.0.0.1 --port "$PORT" \
-    -ngl 999 -c "$ctx" --parallel "$PARALLEL" \
+    -ngl "$NGL" -c "$ctx" --parallel "$PARALLEL" \
     --cache-type-k "$KV" --cache-type-v "$KV" \
     "${EXTRA[@]}" > "$log" 2>&1 &
   local srv=$!
@@ -168,27 +170,72 @@ try_ctx() {
     echo -e "DECODE_OOM\t$peak\t\t"; return 1
   fi
 
-  # Long prompt: the test that actually qualifies this context size.
+  # Long prompt: the test that actually qualifies this context size. Filling the
+  # window is measured with the server's own tokenizer rather than guessed at,
+  # so "95%" really is 95% — and only a handful of tokens is asked back, because
+  # what's being proven is that prefill at that depth survives and still speaks.
   local ok
   ok=$(python3 - "$ctx" "$PORT" "$FILL" <<'PY'
 import json, random, sys, urllib.request
 ctx, port, fill = int(sys.argv[1]), sys.argv[2], int(sys.argv[3])
-words = "alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo lima mike".split()
+
+GEN = 8
+target = max(1, int(ctx * fill / 100) - GEN)
+vocab = "alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo lima mike".split()
 rnd = random.Random(ctx)
-# Random words tokenize at roughly 1.5 tokens each, so this lands near `fill`%
-# of the window without needing a tokenizer round-trip.
-n = max(1, int(ctx * (fill / 100.0) / 1.5))
-body = json.dumps({"messages": [{"role": "user",
-                                 "content": " ".join(rnd.choice(words) for _ in range(n))}],
-                   "max_tokens": 16}).encode()
-req = urllib.request.Request(f"http://127.0.0.1:{port}/v1/chat/completions",
-                             data=body, headers={"content-type": "application/json"})
+
+def post(path, payload, timeout=900):
+    req = urllib.request.Request(f"http://127.0.0.1:{port}{path}",
+                                 data=json.dumps(payload).encode(),
+                                 headers={"content-type": "application/json"})
+    return json.load(urllib.request.urlopen(req, timeout=timeout))
+
+def make(n): return " ".join(rnd.choice(vocab) for _ in range(max(1, n)))
+
+def count(text):
+    # input_tokens includes the chat template wrapper; /tokenize does not, and
+    # that wrapper is exactly what tips a near-full prompt over the limit.
+    msgs = [{"role": "user", "content": text}]
+    try:
+        r = post("/v1/chat/completions/input_tokens", {"messages": msgs}, timeout=120)
+        for k in ("input_tokens", "count", "n_tokens", "tokens"):
+            v = r.get(k)
+            if isinstance(v, int): return v
+            if isinstance(v, list): return len(v)
+    except Exception:
+        pass
+    try:
+        return len(post("/tokenize", {"content": text}, timeout=120)["tokens"])
+    except Exception:
+        return None
+
+words, text, n = max(1, target // 2), None, None
+for _ in range(8):
+    text = make(words)
+    n = count(text)
+    if n is None:                      # no tokenizer endpoint — fall back to an estimate
+        text, n = make(int(target / 1.5)), None
+        break
+    if target * 0.98 <= n <= target:
+        break
+    words = max(1, int(words * target / max(n, 1)))
+# Overshooting gets the request rejected, which is not the failure we're testing for.
+while n is not None and n > target and words > 1:
+    words = max(1, int(words * 0.97)); text = make(words); n = count(text)
+
 try:
-    urllib.request.urlopen(req, timeout=900).read(); print("ok")
+    r = post("/v1/chat/completions",
+             {"messages": [{"role": "user", "content": text}], "max_tokens": GEN})
+    usage = r.get("usage") or {}
+    used = usage.get("prompt_tokens") or n or 0
+    # Surviving prefill isn't enough: it has to actually emit a token.
+    print(f"ok {used}" if (usage.get("completion_tokens") or 0) > 0 else f"fail {used} silent")
 except Exception:
     print("fail")
 PY
 )
+  local filled=""
+  [[ "$ok" == ok\ * ]] && filled="${ok#ok }"
 
   local u; u=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits | head -1)
   (( u > peak )) && peak=$u
@@ -206,10 +253,10 @@ PY
 
   kill $srv 2>/dev/null; sleep 2
 
-  if [[ "$ok" != ok ]] || grep -qiE "CUDA error|ggml_abort|out of memory" "$log"; then
-    echo -e "LONG_OOM\t$peak\t${pre:-}\t${gen:-}"; return 1
+  if [[ "$ok" != ok\ * ]] || grep -qiE "CUDA error|ggml_abort|out of memory" "$log"; then
+    echo -e "LONG_OOM\t$peak\t${pre:-}\t${gen:-}\t${filled:-}"; return 1
   fi
-  echo -e "PASS\t$peak\t${pre:-}\t${gen:-}"; return 0
+  echo -e "PASS\t$peak\t${pre:-}\t${gen:-}\t${filled:-}"; return 0
 }
 
 record() { printf '%s\t%s\n' "$1" "$2" >> "$RESULTS_TSV"; }
@@ -228,13 +275,15 @@ if (( JSON == 0 )); then
   fi
   echo "  kv cache  : $KV | slots: $PARALLEL | step: $STEP | long prompt fills ${FILL}%"
   echo
-  printf '%-10s %-11s %-11s %-10s %s\n' CONTEXT RESULT PEAK_VRAM PREFILL GENERATE
-  printf '%.0s-' {1..60}; echo
+  printf '%-10s %-11s %-11s %-10s %-10s %s\n' \
+    CONTEXT RESULT PEAK_VRAM PREFILL GENERATE FILLED
+  printf '%.0s-' {1..72}; echo
 fi
 
-emit() {  # ctx verdict peak prefill gen
+emit() {  # ctx verdict peak prefill gen filled
   (( JSON == 1 )) && return 0
-  printf '%-10s %-11s %-11s %-10s %s\n' "$1" "$2" "${3:-?}" "${4:-n/a}" "${5:-n/a}"
+  printf '%-10s %-11s %-11s %-10s %-10s %s\n' \
+    "$1" "$2" "${3:-?}" "${4:-n/a}" "${5:-n/a}" "${6:-—}"
 }
 
 BEST=0; BEST_PRE=""; BEST_GEN=""; BEST_PEAK=""
@@ -242,16 +291,16 @@ BEST=0; BEST_PRE=""; BEST_GEN=""; BEST_PEAK=""
 if [[ -n "$LIST" ]]; then
   for c in $LIST; do
     c=$(round_step "$c")
-    IFS=$'\t' read -r v p pre gen < <(try_ctx "$c")
-    emit "$c" "$v" "$p" "$pre" "$gen"
+    IFS=$'\t' read -r v p pre gen fl < <(try_ctx "$c")
+    emit "$c" "$v" "$p" "$pre" "$gen" "$fl"
     record "$c" "$v"
     [[ "$v" == PASS ]] && (( c > BEST )) && { BEST=$c; BEST_PRE=$pre; BEST_GEN=$gen; BEST_PEAK=$p; }
   done
 else
   # Binary search. lo is the largest known-good, hi the smallest known-bad.
   lo=0; hi=$(( MAX + STEP ))
-  IFS=$'\t' read -r v p pre gen < <(try_ctx "$MIN")
-  emit "$MIN" "$v" "$p" "$pre" "$gen"; record "$MIN" "$v"
+  IFS=$'\t' read -r v p pre gen fl < <(try_ctx "$MIN")
+  emit "$MIN" "$v" "$p" "$pre" "$gen" "$fl"; record "$MIN" "$v"
   if [[ "$v" != PASS ]]; then
     (( JSON == 0 )) && { echo; echo "Even the minimum ($MIN) does not run. Try a smaller quant or --kv q4_0."; }
     [[ $JSON == 1 ]] && echo "{\"model\":\"$(basename "$MODEL")\",\"max_context\":0}"
@@ -259,8 +308,8 @@ else
   fi
   lo=$MIN; BEST=$MIN; BEST_PRE=$pre; BEST_GEN=$gen; BEST_PEAK=$p
 
-  IFS=$'\t' read -r v p pre gen < <(try_ctx "$MAX")
-  emit "$MAX" "$v" "$p" "$pre" "$gen"; record "$MAX" "$v"
+  IFS=$'\t' read -r v p pre gen fl < <(try_ctx "$MAX")
+  emit "$MAX" "$v" "$p" "$pre" "$gen" "$fl"; record "$MAX" "$v"
   if [[ "$v" == PASS ]]; then
     BEST=$MAX; BEST_PRE=$pre; BEST_GEN=$gen; BEST_PEAK=$p
     lo=$MAX; hi=$(( MAX + STEP ))
@@ -270,8 +319,8 @@ else
       mid=$(( (lo + hi) / 2 )); mid=$(round_step "$mid")
       (( mid <= lo )) && break
       (( mid >= hi )) && break
-      IFS=$'\t' read -r v p pre gen < <(try_ctx "$mid")
-      emit "$mid" "$v" "$p" "$pre" "$gen"; record "$mid" "$v"
+      IFS=$'\t' read -r v p pre gen fl < <(try_ctx "$mid")
+      emit "$mid" "$v" "$p" "$pre" "$gen" "$fl"; record "$mid" "$v"
       if [[ "$v" == PASS ]]; then
         lo=$mid; BEST=$mid; BEST_PRE=$pre; BEST_GEN=$gen; BEST_PEAK=$p
       else
