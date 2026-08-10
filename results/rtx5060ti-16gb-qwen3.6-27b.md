@@ -1,5 +1,7 @@
 # RTX 5060 Ti 16GB — Qwen3.6-27B-IQ4_XS
 
+**English** · [繁體中文](rtx5060ti-16gb-qwen3.6-27b.zh-TW.md)
+
 Full measurement run, 2026-08-10. This is the data the tool was built from.
 
 Reproduce the ceiling in six boots:

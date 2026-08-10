@@ -1,5 +1,7 @@
 # Gotchas
 
+**English** · [繁體中文](gotchas.zh-TW.md)
+
 Things that quietly cost you context, and how to check for each one.
 
 ## 1. `nvidia-smi` total is not your budget

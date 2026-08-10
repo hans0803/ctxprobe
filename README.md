@@ -1,5 +1,7 @@
 # ctxprobe
 
+**English** · [繁體中文](README.zh-TW.md)
+
 **Estimators tell you a context size should fit. ctxprobe proves it runs.**
 
 Finds the largest context window a GGUF model *actually* works at on a single
@@ -87,6 +89,10 @@ cparams.n_ctx = GGML_PAD(cparams.n_ctx, 256);
 So `-c 35000` silently becomes 35072. Searching in steps of 1024 (a natural
 habit) skips three testable points every step; ctxprobe's default step is 256.
 
+Three more — thinking models returning empty output, desktop processes squatting
+on the card, defunct children still reported healthy — are in
+[docs/gotchas.md](docs/gotchas.md).
+
 ## Usage
 
 ```
@@ -128,9 +134,13 @@ Without torch everything still works, you just don't get that line.
 Measured configurations live in [results/](results/). Contributions for other
 cards welcome — `--json` output is meant to be pasted straight in.
 
-| GPU | Model | Quant | KV | Max context | Generate |
-|---|---|---|---|---|---|
-| RTX 5060 Ti 16GB | Qwen3.6-27B | IQ4_XS | q8_0 | 34,816 | 26.0 tok/s |
+| GPU | Model | Quant | KV | Max context | Prefill | Generate |
+|---|---|---|---|---|---|---|
+| RTX 5060 Ti 16GB | Qwen3.6-27B | IQ4_XS | q8_0 | 34,816 | 901 tok/s | 24.3 tok/s |
+
+Speeds are measured under a window-filling prompt. Generation is faster on an
+empty window (~26 tok/s here) and decays as context fills — quoting the loaded
+figure keeps it honest.
 
 ## Scope
 
