@@ -138,6 +138,36 @@ in either mode.
 Which number to use: `LAZY` if you control the workload and want the most
 context, `EAGER` if the config has to survive whatever gets thrown at it.
 
+### What the pool responds to
+
+With kernels pre-loaded, the remaining failure is the memory pool — and it grows
+against batch shape, not prompt length. Climbing prompt lengths on 25,600 under
+EAGER:
+
+| Prompt | `-fa auto` | `-fa on` | `-fa off` |
+|---|---|---|---|
+| 256 | ok | ok | *refused to start* |
+| **512** | **dies** | **dies** | — |
+
+512 is the `n_ubatch` default: the first full micro-batch, where the pool sizes
+up to its working maximum. Longer prompts are chopped into 512-token
+micro-batches, so nothing past that point changes the shape.
+
+`-fa auto` and `-fa on` are identical, and `-fa off` doesn't start at all:
+
+```
+llama_init_from_model: V cache quantization requires flash_attn
+```
+
+**Quantised V cache pins flash attention on**, whatever `-fa` says. Neither the
+startup log nor `/props` reports this, so ctxprobe now prints it — it changes
+the answer, and two machines disagreeing over the same model would otherwise
+have no visible reason to.
+
+This also makes the prompt ladder's rungs meaningful rather than round: 64 is
+`MMQ_DP4A_MAX_BATCH_SIZE`, 512 is `n_ubatch`, 4096 clears `n_batch` (2048).
+Every failure measured so far lands on one of the first two.
+
 ## Prefill vs prompt length
 
 Measured against the deployed 34,816 config. Each prompt is randomly generated

@@ -112,6 +112,16 @@ GPU_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader | head -1)
 # so record it rather than leaving the discrepancy unexplained.
 (( EAGER )) && export CUDA_MODULE_LOADING=EAGER
 CUDA_LOADING="${CUDA_MODULE_LOADING:-LAZY (default)}"
+# Flash attention moves the ceiling too, and nothing in the server's output or
+# /props reports it. Quantised V cache cannot run without it — llama.cpp refuses
+# to start with "V cache quantization requires flash_attn" — so a quantised KV
+# type pins it on regardless of what -fa says.
+FLASH_ATTN="auto"
+for _a in ${EXTRA[@]+"${EXTRA[@]}"}; do
+  [[ "${_prev:-}" == "-fa" || "${_prev:-}" == "--flash-attn" ]] && FLASH_ATTN="$_a"
+  _prev="$_a"
+done
+[[ "$KV" != "f16" && "$FLASH_ATTN" == "auto" ]] && FLASH_ATTN="on (forced by quantised V cache)"
 
 # Trained context length, so --max defaults to something the model supports.
 if [[ -z "$MAX" ]]; then
@@ -266,6 +276,11 @@ def build(want, seed):
         n = count(text)
     return text, n
 
+# Each rung crosses a real threshold rather than being a round number:
+#   64   MMQ_DP4A_MAX_BATCH_SIZE — dp4a kernels below it, mma at or above
+#   512  n_ubatch default — the first full micro-batch, where the pool sizes up
+#   4096 past n_batch (2048), the other batching bound
+# Measured failures so far land exactly on the first two.
 rungs = [r for r in (64, 512, 4096) if r < target] + [target]
 used = 0
 for i, rung in enumerate(rungs):
@@ -341,6 +356,7 @@ if (( JSON == 0 )); then
   fi
   echo "  kv cache  : $KV | slots: $PARALLEL | step: $STEP | long prompt fills ${FILL}%"
   echo "  cuda      : CUDA_MODULE_LOADING=$CUDA_LOADING | -ngl $NGL"
+  echo "  attention : flash_attn=$FLASH_ATTN"
   echo
   printf '%-10s %-11s %-11s %-10s %-10s %s\n' \
     CONTEXT RESULT PEAK_VRAM PREFILL GENERATE FILLED
@@ -403,10 +419,10 @@ fi
 if (( JSON == 1 )); then
   python3 - "$MODEL" "$GPU_NAME" "$BEST" "$BEST_PEAK" "$BEST_PRE" "$BEST_GEN" \
            "$KV" "$PARALLEL" "$VRAM_TOTAL" "${VRAM_USABLE:-}" "$NGL" "$FILL" \
-           "$CUDA_LOADING" "$VRAM_BASE" <<'PY'
+           "$CUDA_LOADING" "$VRAM_BASE" "$FLASH_ATTN" <<'PY'
 import json, os, sys
 (m, gpu, best, peak, pre, gen, kv, par, total, usable,
- ngl, fill, cuda_loading, free) = sys.argv[1:15]
+ ngl, fill, cuda_loading, free, flash_attn) = sys.argv[1:16]
 print(json.dumps({
     # Bump when the shape of this object changes, so collected results stay
     # interpretable once several machines have contributed.
@@ -419,6 +435,7 @@ print(json.dumps({
     "kv_cache_type": kv, "slots": int(par), "n_gpu_layers": int(ngl),
     "fill_percent": int(fill),
     "cuda_module_loading": cuda_loading,
+    "flash_attn": flash_attn,
     "vram_total_mib": int(total),
     "vram_allocatable_mib": int(usable) if usable else None,
     "vram_held_by_others_mib": int(free) if free else None,

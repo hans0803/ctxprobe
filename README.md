@@ -46,7 +46,21 @@ There are already good VRAM *estimators* — [oobabooga's regression formula](ht
 (19,517 measurements), llama.cpp's own `llama-fit-params`, and half a dozen
 calculators. They answer **"will it load?"** and they answer it well.
 
-That is not the same question as **"will it work?"**
+There are three questions, not two:
+
+| | Question | This model, this card |
+|---|---|---|
+| Estimators | Will it load? | ~35K |
+| `ctxprobe` | Will it run *what I just ran*? | **34,816** |
+| `ctxprobe --eager` | Will it run *anything*? | **25,344** |
+
+The last two differ by **9,472 tokens — 27%**. That gap is the part of the
+ceiling resting on "this workload never reaches a kernel it hasn't reached yet".
+CUDA 12 loads kernel code on first touch, so a config that passed every test can
+still die later on a different sampler, a grammar, or another batch shape.
+`--eager` loads everything up front and reports what holds regardless.
+
+Nobody measures the middle row, and almost nobody knows the bottom one exists.
 
 Real numbers from an RTX 5060 Ti (16 GB), Qwen3.6-27B-IQ4_XS + q8_0 KV:
 

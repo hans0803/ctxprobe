@@ -135,6 +135,36 @@ LAZY 的數字是**這次測試**的性質，EAGER 的數字才是**這個 confi
 該用哪個數字：如果你能掌控工作負載、又想要最多的 context，用 `LAZY`；
 如果這個 config 得撐住別人丟過來的任何東西，用 `EAGER`。
 
+### 記憶體池對什麼有反應
+
+kernel 都預先載入之後，剩下的失敗來源就是記憶體池 ——
+而它的成長跟 batch 形狀有關，跟 prompt 長度無關。
+在 EAGER 之下對 25,600 逐級加長 prompt：
+
+| Prompt | `-fa auto` | `-fa on` | `-fa off` |
+|---|---|---|---|
+| 256 | ok | ok | *根本啟動不了* |
+| **512** | **死亡** | **死亡** | — |
+
+512 正是 `n_ubatch` 的預設值：第一個完整的 micro-batch，
+池在這裡擴張到它的工作上限。更長的 prompt 會被切成 512 個 token 的
+micro-batch，所以超過這一點之後形狀就不再改變。
+
+`-fa auto` 和 `-fa on` 完全一致，而 `-fa off` 根本啟動不了：
+
+```
+llama_init_from_model: V cache quantization requires flash_attn
+```
+
+**量化的 V cache 會把 flash attention 釘在開啟狀態**，不管 `-fa` 寫什麼。
+啟動 log 和 `/props` 都不會回報這件事，所以 ctxprobe 現在會印出來 ——
+它會改變答案，而兩台機器對同一個模型得到不同結果時，
+否則根本看不出原因。
+
+這也讓 prompt 階梯的每一階從「湊整數」變成「有依據」：
+64 是 `MMQ_DP4A_MAX_BATCH_SIZE`、512 是 `n_ubatch`、4096 跨過 `n_batch`（2048）。
+目前量到的每一次失敗，都精確落在前兩者之一。
+
 ## Prefill 與 prompt 長度的關係
 
 對照已部署的 34,816 配置量測。每個 prompt 都是隨機產生的，
