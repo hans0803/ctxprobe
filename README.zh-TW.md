@@ -98,6 +98,16 @@ cparams.n_ctx = GGML_PAD(cparams.n_ctx, 256);
 另外三個坑 —— thinking 模型回傳空輸出、桌面程序佔住顯卡、
 子程序已死但仍被回報為健康 —— 收在 [docs/gotchas.zh-TW.md](docs/gotchas.zh-TW.md)。
 
+## 入門指南
+
+剛開始接觸？下面這兩個設定決定了你大部分的結果：
+
+- [模型量化：你該下載哪一個？](docs/model-quant.zh-TW.md) ——
+  看懂 `Q4_K_M` / `IQ4_XS` 這些名字，以及為什麼「裝得下的最大量化」
+  勝過「裝不下的更好量化」。
+- [KV cache 量化：為什麼你多半該用 q8_0](docs/kv-cache-quant.zh-TW.md) ——
+  單卡跑長 context 時，槓桿最大的一個設定。
+
 ## 用法
 
 ```

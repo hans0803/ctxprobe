@@ -102,6 +102,16 @@ Three more — thinking models returning empty output, desktop processes squatti
 on the card, defunct children still reported healthy — are in
 [docs/gotchas.md](docs/gotchas.md).
 
+## Guides
+
+New to this? These two settings decide most of your outcome:
+
+- [Model quantisation: which one should you download?](docs/model-quant.md) —
+  reading `Q4_K_M` / `IQ4_XS` names, and why the biggest quant that *fits* beats
+  a better one that doesn't.
+- [KV cache quantisation, and why you probably want q8_0](docs/kv-cache-quant.md)
+  — the single highest-leverage setting for long context on one card.
+
 ## Usage
 
 ```
