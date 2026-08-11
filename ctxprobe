@@ -86,8 +86,13 @@ mkdir -p "$OUT"
 # nvidia-smi's total includes a driver reserve that no allocation can touch
 # (~460 MiB on a 16 GB card). Headroom measured against it is fiction, so ask
 # CUDA what it really exposes when a torch build happens to be available.
-VRAM_TOTAL=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits | head -1)
-VRAM_BASE=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits | head -1)
+# Everything must report the GPU this run actually uses. Taking index 0 blindly
+# reads another card's usage on a multi-GPU box, which silently invalidates
+# every VRAM figure below.
+GPU_IDX="${CUDA_VISIBLE_DEVICES%%,*}"; GPU_IDX="${GPU_IDX:-0}"
+smi() { nvidia-smi -i "$GPU_IDX" "$@"; }
+VRAM_TOTAL=$(smi --query-gpu=memory.total --format=csv,noheader,nounits | head -1)
+VRAM_BASE=$(smi --query-gpu=memory.used --format=csv,noheader,nounits | head -1)
 read_usable() {
   # Must be cudaMemGetInfo, which is what CUDA will actually hand out.
   # NVML/nvidia-smi report the physical size of the board instead — using those
@@ -109,7 +114,7 @@ print(int(f / 2**20), int(t / 2**20))'
 VRAM_INFO=$(read_usable || true)
 VRAM_FREE=${VRAM_INFO% *}; VRAM_USABLE=${VRAM_INFO#* }
 [[ "$VRAM_INFO" == *" "* ]] || { VRAM_FREE=""; VRAM_USABLE=""; }
-GPU_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader | head -1)
+GPU_NAME=$(smi --query-gpu=name --format=csv,noheader | head -1)
 # Lazy vs eager module loading decides when a kernel's code is pulled into VRAM,
 # which moves the ceiling. Two machines set differently give different answers,
 # so record it rather than leaving the discrepancy unexplained.
@@ -220,7 +225,7 @@ try_ctx() {
   local peak=0 ready=no
   for _ in $(seq 1 300); do
     kill -0 $srv 2>/dev/null || break
-    local u; u=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits | head -1)
+    local u; u=$(smi --query-gpu=memory.used --format=csv,noheader,nounits | head -1)
     (( u > peak )) && peak=$u
     if curl -sf --max-time 2 "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; then ready=yes; break; fi
     sleep 2
@@ -331,7 +336,7 @@ LADDER
     fail\ *)   filled="died@${ok#fail }" ;;   # which rung killed it
   esac
 
-  local u; u=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits | head -1)
+  local u; u=$(smi --query-gpu=memory.used --format=csv,noheader,nounits | head -1)
   (( u > peak )) && peak=$u
 
   # Speeds come from the server's own timing lines — present regardless of how
@@ -368,7 +373,7 @@ record() { printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
 if (( JSON == 0 )); then
   echo "ctxprobe"
   echo "  model     : $(basename "$MODEL") ($(du -h "$MODEL" | cut -f1))"
-  echo "  gpu       : $GPU_NAME"
+  echo "  gpu       : $GPU_NAME (index $GPU_IDX)"
   echo "  vram      : ${VRAM_TOTAL} MiB reported by nvidia-smi, ${VRAM_BASE} MiB already in use"
   if [[ -n "$VRAM_USABLE" ]]; then
   echo "              ${VRAM_USABLE} MiB actually allocatable ($(( VRAM_TOTAL - VRAM_USABLE )) MiB is driver reserve)"

@@ -119,7 +119,32 @@ llama-server ... --reasoning-budget 0
 
 Benchmarks that only look at tokens/s won't notice; ones that check output will.
 
-## 7. Desktop processes squat on the discrete GPU
+## 8. `n_ubatch` 512 is a bad default for sparse MoE
+
+Prefill reads experts once per ubatch. With top-6-of-256 routing, a 512-token
+batch collectively touches nearly every expert, so **each ubatch drags the whole
+expert set of a layer across the bus** — a cost amortised over however many
+tokens share that batch.
+
+Raising it on a DeepSeek-V4-Flash (137 GB, experts in DDR5):
+
+| ubatch | Prefill | VRAM |
+|---|---|---|
+| 512 (default) | 151 tok/s | 9.1 GB |
+| **8192** | **775 tok/s** | 12.5 GB |
+
+**5.1× for 3.5 GB.** Past 8192 prefill is flat while VRAM keeps climbing, so
+bigger is not automatically better — aim for "splits your prompt into 2-3
+passes".
+
+Two caveats. The gain is zero below 512 tokens (one pass either way), so short
+chat turns see nothing. And generation is unaffected — decoding is batch-of-1,
+which is also what makes this measurable cleanly.
+
+This only matters when experts are on the far side of a slow link. A dense model
+fully in VRAM has no equivalent cliff.
+
+## 9. Desktop processes squat on the discrete GPU
 
 Two separate offenders, worth ~590 MiB together on our box:
 

@@ -235,6 +235,7 @@ Without torch everything still works, you just don't get that line.
 
 | GPU | Model | Quant | KV | Max context | Prefill | Generate |
 |---|---|---|---|---|---|---|
+| RTX 5090 32GB | DeepSeek-V4-Flash | UD-IQ4_XS | q8_0 | 131,072 ‡ | 775 tok/s | 13.3 tok/s |
 | RTX 5060 Ti 16GB | Gemma4-26B-A4B | QAT q4_0 | q8_0 | **105,984** | 1890 tok/s | 50.8 tok/s |
 | RTX 5060 Ti 16GB | Qwen3.6-27B | IQ4_XS | q8_0 | 34,816 | 858 tok/s | 24.6 tok/s |
 | RTX 5060 Ti 16GB | Qwen3.6-27B | IQ4_XS | f16 | 20,224 | 923 tok/s | 26.9 tok/s |
@@ -242,6 +243,10 @@ Without torch everything still works, you just don't get that line.
 
 † Does not fit: only 28 of 65 layers on the GPU, the rest in system RAM. See
 [spill-cost.md](docs/spill-cost.md).
+
+‡ 136.66 GB model, experts in DDR5 via `--cpu-moe`; the ceiling is ctxprobe's
+search cap, and it is ladder-verified but not fill-validated. Prefill quoted at
+`-ub 8192`; the default 512 gives 151 tok/s.
 
 The first two rows are the same model on the same card, one flag apart. Full run,
 including how the ceiling moved as VRAM was freed:
