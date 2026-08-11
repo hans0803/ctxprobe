@@ -144,7 +144,40 @@ which is also what makes this measurable cleanly.
 This only matters when experts are on the far side of a slow link. A dense model
 fully in VRAM has no equivalent cliff.
 
-## 9. Desktop processes squat on the discrete GPU
+## 9. `--tensor-split` cannot fix uneven MoE placement
+
+The instinct when one card fills up and the other sits idle is to reach for
+`--tensor-split`. On a MoE model with experts offloaded, it does nothing:
+
+```
+--n-cpu-moe 35, two 32 GB cards
+  GPU0  8.4 GB      GPU1  31.1 GB     ← 24 GB idle
+--tensor-split 1,1 and 3,1 → both OOM
+```
+
+Two mechanisms compose badly. Layer split is **contiguous** — one card takes an
+early block of layers, the other takes the rest. `--n-cpu-moe N` leaves the
+GPU-side experts in the **last** N layers, also contiguous. That block lands
+whole on one card, and moving the split point cannot separate it.
+
+The fix is `-ot`, naming tensors explicitly:
+
+```bash
+-ot "blk\.(3[0-5])\.ffn_.*_exps\.weight=CUDA0" \
+-ot "blk\.(3[6-9]|4[0-2])\.ffn_.*_exps\.weight=CUDA1" \
+--cpu-moe
+```
+
+**One regex range per flag, and `-ot` before `--cpu-moe`.** Two ways to get it
+silently wrong: putting a `=CPU` pattern first (it swallows everything), or
+joining patterns with commas (the greedy `.*` eats the separator and matches
+nothing). Neither errors — the tell is VRAM sitting at the no-experts-on-GPU
+baseline while generation stays at the all-CPU figure.
+
+Worth knowing before buying a second card: doing this correctly bought +18%
+generation, against 5.1x prefill from raising `n_ubatch` alone.
+
+## 10. Desktop processes squat on the discrete GPU
 
 Two separate offenders, worth ~590 MiB together on our box:
 

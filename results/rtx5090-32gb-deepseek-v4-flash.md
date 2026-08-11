@@ -138,6 +138,96 @@ So `-ub 8192` costs 3.5 GB of VRAM and is worth nothing for short chat turns,
 1.6-2.6× for prompts with a system prompt and some history, and 5× for documents.
 On a 32 GB card with ~20 GB spare, there is no reason not to set it.
 
+## Keeping some experts on the GPU
+
+`--cpu-moe` evicts every expert. `--n-cpu-moe N` keeps the experts of the first
+N layers in RAM, so a smaller N leaves more on the card. Single GPU, `-ub 8192`,
+`-c 24576`:
+
+| `--n-cpu-moe` | GPU layers | Peak VRAM | Prefill | Generate |
+|---|---|---|---|---|
+| 43 (= `--cpu-moe`) | 0 | 12,345 MiB | 621.11 | 12.08 |
+| 40 | 3 | 20,889 MiB | 643.99 | 12.91 |
+| **38** | **5** | 26,585 MiB | 669.30 | **13.37** |
+| 36 | 7 | ✗ OOM | — | — |
+
+The VRAM steps are exactly linear — 8,544 MiB for 3 layers, 5,696 for 2 — giving
+**2,848 MiB per layer**. That figure predicted every capacity result below, so it
+is worth deriving for any model you plan to place by hand.
+
+Five layers is the ceiling on 32 GB, and it buys **+11% generate for 14 GB**.
+
+### Both cards
+
+Two 5090s, experts placed explicitly across them. Layer ranges split evenly, one
+regex per `-ot` flag:
+
+| Layers on GPU | GPU0 + GPU1 | Total | Prefill | Generate |
+|---|---|---|---|---|
+| 7 | 19,775 + 16,873 | 36.6 GB | 718.85 | 13.84 |
+| 13 | 25,471 + 28,263 | 53.7 GB | 821.51 | 15.86 |
+| 14 | 28,319 + 28,263 | 56.6 GB | 841.92 | 13.70 |
+| 15 | 31,167 + 28,263 | 59.4 GB | 860.60 | 14.34 |
+| 16 | 31,167 + 31,111 | **62.3 GB** | **884.79** | 13.38 |
+| 17 | ✗ OOM | 65.1 GB predicted | — | — |
+
+Capacity behaves exactly as 2,848 MiB/layer predicts: 16 layers fit at 62.3 GB
+against 64.2 GB allocatable, 17 does not.
+
+**Prefill is monotonic** (719 → 885, +23% over the range) because it is compute
+bound once ubatch has fixed the bandwidth problem, and a second card adds
+compute.
+
+**Generate is not monotonic**, and that is not measurement noise. Routing is
+per-token: each token picks 6 of 256 experts, and `-ot` places experts *by
+layer*, not by how often they are used. Whether a given token's experts happen
+to sit on a card or in DDR5 varies with what the model generates, so throughput
+varies with the content. A fixed tok/s figure does not exist for this
+configuration — only a range, here roughly **13.4 to 15.9**.
+
+### Is the second card worth it
+
+| Setup | Generate | Prefill | VRAM |
+|---|---|---|---|
+| Single card, `--n-cpu-moe 38` | 13.37 | 669 | 26.6 GB |
+| Two cards, 13-16 layers | 13.4 – 15.9 | 821 – 885 | 53.7 – 62.3 GB |
+
+Roughly **+18% generate and +23% prefill for an entire second 32 GB card**. Set
+against `-ub 8192`, which bought 5.1× prefill for 3.5 GB, the exchange rate is
+poor. Worth it only if prefill specifically matters to you.
+
+## What does not work
+
+**`--tensor-split` does nothing here.** Both `1,1` and `3,1` failed to load at
+13 layers, and the first dual-GPU attempt without `-ot` left GPU0 at 8.4 GB while
+GPU1 hit 31.1 GB.
+
+The reason is that two mechanisms compose badly. Layer split is *contiguous*:
+GPU0 takes an early block of layers, GPU1 the rest. `--n-cpu-moe N` leaves the
+GPU-side experts in the *last* N layers — one contiguous block, which lands
+entirely on one card. Moving the split point cannot separate them; only naming
+tensors explicitly can.
+
+Two ways to get `-ot` silently wrong, both of which produced a table full of
+plausible numbers before being caught:
+
+```bash
+# WRONG — the CPU pattern comes first and swallows everything
+-ot "blk\.(3[0-9])\.ffn_.*_exps\.weight=CPU" -ot "blk\.30\..*=CUDA0"
+
+# WRONG — greedy .* eats the comma separator, matching nothing
+-ot "blk\.36\.ffn_.*_exps\.weight=CUDA0,blk\.37\.ffn_.*_exps\.weight=CUDA0"
+
+# RIGHT — one regex range per flag, -ot before --cpu-moe
+-ot "blk\.(3[0-5])\.ffn_.*_exps\.weight=CUDA0" \
+-ot "blk\.(3[6-9]|4[0-2])\.ffn_.*_exps\.weight=CUDA1" \
+--cpu-moe
+```
+
+Neither mistake reports an error. The tell is VRAM sitting at the
+no-experts-on-GPU baseline — 8,381 + 8,329 MiB here — while generate stays at
+the all-CPU figure.
+
 ## Practical configuration
 
 ```bash
