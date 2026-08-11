@@ -6,7 +6,7 @@ Full measurement run, 2026-08-10. This is the data the tool was built from.
 Covers both `q8_0` and `f16` KV cache, so the cost of not quantising it is
 visible rather than assumed.
 
-Reproduce the ceiling in six boots:
+Reproduce the ceiling in six boots plus one to validate the winner:
 
 ```bash
 ctxprobe Qwen3.6-27B-IQ4_XS.gguf --min 32768 --max 36864 -- --reasoning-budget 0
@@ -50,7 +50,7 @@ make that choice on your own card: [model-quant.md](../docs/model-quant.md).
 | 30,720 | PASS | 15825 MiB | 26.00 tok/s |
 | 33,792 | PASS | 15797 MiB | 26.01 tok/s |
 | **34,816** | **PASS** | 15845 MiB | **25.99 tok/s** |
-| 35,072 | **LONG_OOM** | 15847 MiB | 25.98 tok/s |
+| 35,072 | **PREFILL_OOM** | 15847 MiB | 25.98 tok/s |
 | 35,328 | FAIL | — | — |
 | 36,864 | FAIL | — | — |
 
@@ -60,10 +60,14 @@ tok/s under a real one — an artefact of fixed overhead, not a rate. Prefill is
 only meaningful measured against prompt length, which is the next section.
 
 **34,816 is the ceiling**, re-confirmed with the window filled to 95%
-(32,997 tokens measured through the server's tokenizer). 35,072 loads, decodes a
-short prompt at full speed, then CUDA-OOMs on a real prompt and leaves a defunct
-process behind. It is the single clearest argument for validating with a
-full-size prompt.
+(32,997 tokens measured through the server's tokenizer). 35,072 loads, decodes
+the 18-token warm-up at full speed, then CUDA-OOMs on a **64-token** prompt and
+leaves a defunct process behind.
+
+These runs predate the prompt ladder, so they were qualified with a
+window-filling prompt throughout. The ladder was built once it became clear that
+64 tokens separates 34,816 from 35,072 just as reliably — the argument was never
+for a *long* prompt, it was for a prompt larger than the warm-up.
 
 Generation speed is flat at ~26 tok/s across the whole range — context costs
 memory, not throughput, until you hit the wall.
@@ -252,10 +256,21 @@ Sampled `nvidia-smi` every 50 ms across a full prefill + decode cycle, 481 sampl
 min 15845 MiB, max 15845 MiB
 ```
 
-**llama.cpp's VRAM usage is completely static.** All buffers are allocated at
-load time and nothing grows during inference. So a config that loads and passes
-a full-window prompt will not OOM later from inference alone — the margin only
-has to survive other processes touching the card.
+**llama.cpp's buffer allocation is completely static.** Everything is allocated
+at load time and nothing grows during inference.
+
+This is exactly why the 35,072 failure was misread for so long: if nothing
+grows, a crash under load looks impossible. What the sampler cannot see is
+kernel code being pulled into device memory on first touch — an allocation that
+never enters `nvidia-smi`'s usage figure *because it fails*, and that is under
+the 1 MiB resolution even when it succeeds.
+
+So the correct statement is narrower than it looks. Under `LAZY` loading, a
+config that passed every prompt here can still OOM later on a kernel it hasn't
+reached yet — a different sampler, a grammar, another batch shape. Under
+`EAGER`, where every kernel is resident from startup, static allocation does
+mean what it appears to mean: the margin only has to survive other processes
+touching the card.
 
 ## Rejected: NVFP4
 

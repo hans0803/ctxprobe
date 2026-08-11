@@ -5,8 +5,9 @@
 **Estimators tell you a context size should fit. ctxprobe proves it runs.**
 
 Finds the largest context window a GGUF model *actually* works at on a single
-GPU — by booting it, filling the window with a real prompt, and checking it
-survives. One bash script, no dependencies beyond `llama-server` and `python3`.
+GPU — by booting it, climbing a ladder of prompts until one kills it, and
+validating the survivor against a full window. One bash script, no dependencies
+beyond `llama-server` and `python3`.
 
 ```bash
 # with no bounds it searches from 2048 up to the model's trained context;
@@ -21,7 +22,7 @@ Real output, RTX 5060 Ti 16GB:
   gpu       : NVIDIA GeForce RTX 5060 Ti
   vram      : 16311 MiB reported by nvidia-smi, 15 MiB already in use
               15849 MiB actually allocatable (462 MiB is driver reserve)
-  kv cache  : q8_0 | slots: 1 | step: 256 | long prompt fills 95%
+  kv cache  : q8_0 | slots: 1 | step: 256 | winner validated at 95% fill
   cuda      : CUDA_MODULE_LOADING=LAZY (default) | -ngl 999
   attention : flash_attn=on (forced by quantised V cache)
 
@@ -32,7 +33,7 @@ CONTEXT    RESULT      PEAK_VRAM   PREFILL    GENERATE   FILLED
 34816      PASS        15845       968.55     28.55      4042
 35840      DECODE_OOM  15805       n/a        n/a        —
 35328      DECODE_OOM  15787       n/a        n/a        —
-35072      LONG_OOM    15847       94.03      26.47      died@64
+35072      PREFILL_OOM 15847       94.03      26.47      died@64
 
 Validating 34816 at 95% fill...
   confirmed: 34816 (32826 tokens filled)
@@ -70,12 +71,13 @@ Nobody measures the middle row, and almost nobody knows the bottom one exists.
 
 Real numbers from an RTX 5060 Ti (16 GB), Qwen3.6-27B-IQ4_XS + q8_0 KV:
 
-| Context | Loads? | Short prompt | 30K-token prompt |
+| Context | Loads? | 18-token prompt | 64-token prompt |
 |---|---|---|---|
 | 34816 | yes | 25.99 tok/s | **works** |
 | 35072 | yes | 25.98 tok/s | **CUDA OOM, server dies** |
 
-35072 loads fine and generates at full speed. Then a realistic prompt kills it:
+35072 loads fine and generates at full speed. Then a **64-token** prompt kills
+it — not a long one, not a window-filling one, sixty-four tokens:
 
 ```
 launch_mul_mat_q at mmq.cuh:1375
@@ -83,11 +85,12 @@ cudaFuncSetAttribute(mul_mat_q<type, J, false>, cudaFuncAttributeMaxDynamicShare
 CUDA error: out of memory
 ```
 
-**A long prompt reaches CUDA kernels a short one never touches.** llama.cpp's
-quantized matmul is templated on batch shape, so a larger prefill instantiates a
-different `mul_mat_q` variant — and under CUDA's lazy module loading (the default
-since CUDA 12), touching a kernel for the first time loads its code into device
-memory. With VRAM nearly exhausted, that load is what fails.
+**A larger prefill reaches CUDA kernels a smaller one never touches.**
+llama.cpp's quantized matmul is templated on batch shape, so a bigger batch
+instantiates a different `mul_mat_q` variant — and under CUDA's lazy module
+loading (the default since CUDA 12), touching a kernel for the first time loads
+its code into device memory. With VRAM nearly exhausted, that load is what
+fails. The switch happens at `MMQ_DP4A_MAX_BATCH_SIZE`, which is 64.
 
 Note what this is *not*: allocation growing during inference. Sampled every
 50 ms across a full prefill and decode, VRAM never moved off 15845 MiB. The run
@@ -119,15 +122,19 @@ a new kernel variant gets instantiated. The prompt ladder exploits this: it
 climbs 64 → 512 → 4096 → full and stops at the first death, so a doomed config
 is rejected in seconds instead of after a 30K-token prefill.
 
-`PASS` therefore means the run survived a prompt filling **95% of the window**
-and still emitted tokens. That percentage is measured, not estimated: the length
-is converged on using the server's own `/v1/chat/completions/input_tokens`
-endpoint, so it accounts for the chat template wrapper — which is exactly what
-tips a near-full prompt over the limit. The `FILLED` column reports the real
-prompt size that was pushed through.
+`PASS` during the search therefore means the run cleared every rung and still
+emitted tokens. The **winner alone** is then re-booted and given a prompt filling
+95% of the window — the number that gets reported is still backed by a full-size
+prompt, and that second boot doubles as an independent re-run of the ceiling.
 
-Only 8 tokens are requested back. The question is whether prefill at that depth
-survives and the model still speaks, not how fast it writes.
+That 95% is measured, not estimated: the length is converged on using the
+server's own `/v1/chat/completions/input_tokens` endpoint, so it accounts for the
+chat template wrapper — exactly what tips a near-full prompt over the limit. The
+`FILLED` column reports the real prompt size that was pushed through, or
+`died@N` for the rung that killed the run.
+
+Only 8 tokens are requested back. The question is whether prefill survives and
+the model still speaks, not how fast it writes.
 
 ## Start here
 
@@ -173,9 +180,9 @@ cparams.n_ctx = GGML_PAD(cparams.n_ctx, 256);
 So `-c 35000` silently becomes 35072. Searching in steps of 1024 (a natural
 habit) skips three testable points every step; ctxprobe's default step is 256.
 
-Three more are in [gotchas.md](docs/gotchas.md): thinking models returning empty
-output, desktop processes squatting on the card, and dead children still being
-reported healthy.
+Four more are in [gotchas.md](docs/gotchas.md): why `PEAK_VRAM` can never tell
+you what is about to fail, thinking models returning empty output, desktop
+processes squatting on the card, and dead children still being reported healthy.
 
 ## Usage
 
@@ -187,15 +194,25 @@ ctxprobe MODEL.gguf [options] [-- extra llama-server args]
   --step N       granularity (default 256)
   --kv TYPE      KV cache type: q8_0 (default), f16, q4_0
   --parallel N   server slots (default 1)
-  --list "A B C" test these sizes instead of binary-searching
-  --fill PCT     how full the long prompt should be (default 95)
   --ngl N        layers on GPU (default 999 = all; lower spills to system RAM)
-  --json         machine-readable output
+  --list "A B C" test these sizes instead of binary-searching
+  --fill PCT     how full the winner's validation prompt is (default 95)
+  --eager        CUDA_MODULE_LOADING=EAGER — a smaller ceiling that doesn't
+                 depend on which kernels this run happened to touch
+  --port N       port for the probe server (default 6099)
+  --out DIR      where logs and results.tsv go (default ./ctxprobe-out)
+  --json         machine-readable output (progress goes to stderr)
   --keep         keep per-run logs
 ```
 
 Binary search by default, so finding a ceiling takes ~log₂(range) boots rather
-than one per candidate. Each boot reloads the model, so expect a few minutes.
+than one per candidate, plus one more to validate the winner at full length.
+Each boot reloads the model; the ladder means a doomed size is rejected in
+seconds rather than after a 30K-token prefill, so the search above took under
+two minutes rather than fifteen.
+
+Every run writes `results.tsv` into `--out`, one row per boot, with the
+validation row marked `final:`.
 
 Extra `llama-server` flags pass through after `--`:
 
@@ -218,6 +235,7 @@ Without torch everything still works, you just don't get that line.
 
 | GPU | Model | Quant | KV | Max context | Prefill | Generate |
 |---|---|---|---|---|---|---|
+| RTX 5060 Ti 16GB | Gemma4-26B-A4B | QAT q4_0 | q8_0 | **105,984** | 1890 tok/s | 50.8 tok/s |
 | RTX 5060 Ti 16GB | Qwen3.6-27B | IQ4_XS | q8_0 | 34,816 | 858 tok/s | 24.6 tok/s |
 | RTX 5060 Ti 16GB | Qwen3.6-27B | IQ4_XS | f16 | 20,224 | 923 tok/s | 26.9 tok/s |
 | RTX 5060 Ti 8GB *(simulated)* | Qwen3.6-27B | IQ4_XS | q8_0 | 4,096 † | 391 tok/s | 5.11 tok/s |

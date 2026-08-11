@@ -72,6 +72,10 @@ return !fp16_mma_hardware_available(cc) || ne11 < MMQ_DP4A_MAX_BATCH_SIZE;
 根本不存在 64 這個切換點。這個門檻既是 llama.cpp 的性質，
 也同樣是你那張卡世代的性質。
 
+這就是 `ctxprobe` 回報的 `PREFILL_OOM`，而 `died@64` 會指出是哪一階殺死它的。
+這個判定以前叫 `LONG_OOM` —— 那是「相信 buffer 會隨 prompt 長度成長」時期的遺留。
+它們並不會成長，而那個名字會讓人去找一個根本不存在的記憶體洩漏。
+
 相關的一點：子程序這樣死掉之後會變成殭屍程序（defunct），
 而只追蹤自己狀態的上層 gateway 會繼續回報這個部署是健康的。
 要檢查程序，不是檢查狀態端點。

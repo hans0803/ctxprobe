@@ -73,6 +73,11 @@ On a card without FP16 MMA the left side short-circuits and everything uses
 dp4a, so there is no switch at 64 at all. The threshold is a property of your
 GPU generation as much as of llama.cpp.
 
+This is what `ctxprobe` reports as `PREFILL_OOM`, with `died@64` naming the rung
+that killed it. It used to be called `LONG_OOM`, which was a leftover from
+believing the buffers grew with prompt length — they don't, and the name sent
+people looking for a memory leak that isn't there.
+
 Related: when the child dies this way it becomes a defunct process, and a
 supervising gateway that only tracks its own state will keep reporting the
 deployment as healthy. Check the process, not the status endpoint.

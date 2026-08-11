@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 # ctxprobe — find the largest context a GGUF actually runs at on one GPU.
 #
-# Estimators tell you a context size should fit. ctxprobe proves it runs:
-# every candidate is booted for real, given a short prompt, and then given a
-# prompt that fills most of the window. A larger prefill instantiates CUDA
-# kernels a short prompt never touches, and loading one for the first time needs
-# device memory a nearly-full card doesn't have — so a config can load fine,
-# decode a short prompt at full speed, and still CUDA-OOM on a real one.
+# Estimators tell you a context size should fit. ctxprobe proves it runs: every
+# candidate is booted for real and fed a ladder of prompts — 64, 512, 4096
+# tokens — stopping at the first one that kills it. A larger prefill instantiates
+# CUDA kernels a shorter one never touches, and loading one for the first time
+# needs device memory a nearly-full card hasn't got, so a config can load fine,
+# decode an 18-token prompt at full speed, and still CUDA-OOM on a 64-token one.
+# The winner is then re-validated once against a prompt that fills the window.
 #
 # Usage:
 #   ctxprobe MODEL.gguf [options] [-- extra llama-server args]
@@ -21,10 +22,11 @@
 #                     system RAM — useful for measuring what overflow costs,
 #                     but then a PASS no longer means "ran entirely on the GPU"
 #   --list "A B C"    test these sizes instead of binary-searching
-#   --fill PCT        how full the long prompt should be, 0-100 (default 95).
-#                     Measured with the server tokenizer, so it is the real figure
+#   --fill PCT        how full the winner's validation prompt is, 1-100
+#                     (default 95). Measured with the server tokenizer, so it is
+#                     the real figure. The search itself stops at 4096 tokens
 #   --port N          port for the probe server (default 6099)
-#   --out DIR         where logs go (default ./ctxprobe-out)
+#   --out DIR         where logs and results.tsv go (default ./ctxprobe-out)
 #   --eager           set CUDA_MODULE_LOADING=EAGER: loads every kernel up front
 #                     so the answer doesn't depend on which kernels this run
 #                     happened to touch. Gives a smaller but portable ceiling
@@ -71,6 +73,7 @@ done
 
 [[ -n "$MODEL" ]] || die "usage: ctxprobe MODEL.gguf [options]  (--help for more)"
 [[ -f "$MODEL" ]] || die "model not found: $MODEL"
+(( FILL >= 1 && FILL <= 100 )) || die "--fill must be between 1 and 100, got: $FILL"
 
 LLAMA_BIN="${LLAMA_SERVER:-$(command -v llama-server || echo "$HOME/llama.cpp/build/bin/llama-server")}"
 [[ -x "$LLAMA_BIN" ]] || die "llama-server not found. Set LLAMA_SERVER=/path/to/llama-server"
@@ -117,11 +120,23 @@ CUDA_LOADING="${CUDA_MODULE_LOADING:-LAZY (default)}"
 # to start with "V cache quantization requires flash_attn" — so a quantised KV
 # type pins it on regardless of what -fa says.
 FLASH_ATTN="auto"
+_prev=""
 for _a in ${EXTRA[@]+"${EXTRA[@]}"}; do
-  [[ "${_prev:-}" == "-fa" || "${_prev:-}" == "--flash-attn" ]] && FLASH_ATTN="$_a"
+  # Only accept a real value: older llama-server takes -fa as a boolean flag, so
+  # blindly reading the next argument reports "-ngl" as the flash-attn setting.
+  case "$_prev" in
+    -fa|--flash-attn)
+      case "$_a" in on|off|auto|0|1) FLASH_ATTN="$_a" ;; esac ;;
+  esac
   _prev="$_a"
 done
-[[ "$KV" != "f16" && "$FLASH_ATTN" == "auto" ]] && FLASH_ATTN="on (forced by quantised V cache)"
+if [[ "$KV" == q* ]]; then
+  if [[ "$FLASH_ATTN" == off || "$FLASH_ATTN" == 0 ]]; then
+    FLASH_ATTN="off requested — llama-server will refuse to start with quantised KV"
+  else
+    FLASH_ATTN="on (forced by quantised V cache)"
+  fi
+fi
 
 # Trained context length, so --max defaults to something the model supports.
 if [[ -z "$MAX" ]]; then
@@ -334,12 +349,15 @@ LADDER
 
   # A server that survives but emits nothing is not out of memory — usually it's
   # a thinking model that spent the whole budget reasoning (see gotchas.md).
-  # Reporting that as LONG_OOM sends people hunting for a memory problem.
+  # Reporting that as an OOM sends people hunting for a memory problem.
   if [[ "$ok" == silent\ * ]] && ! grep -qiE "CUDA error|ggml_abort|out of memory" "$log"; then
     echo -e "SILENT\t$peak\t${pre:-}\t${gen:-}\t${filled:-}"; return 1
   fi
+  # PREFILL_OOM, not LONG_OOM: the killing prompt is usually 64 tokens, not a
+  # long one. Naming it after length was a leftover from believing the buffers
+  # grew with prompt size, and it sent people looking in the wrong place.
   if [[ "$ok" != ok\ * ]] || grep -qiE "CUDA error|ggml_abort|out of memory" "$log"; then
-    echo -e "LONG_OOM\t$peak\t${pre:-}\t${gen:-}\t${filled:-}"; return 1
+    echo -e "PREFILL_OOM\t$peak\t${pre:-}\t${gen:-}\t${filled:-}"; return 1
   fi
   echo -e "PASS\t$peak\t${pre:-}\t${gen:-}\t${filled:-}"; return 0
 }
@@ -365,7 +383,7 @@ if (( JSON == 0 )); then
   echo "               nvidia-smi's figure above includes driver reserve. Set"
   echo "               CTXPROBE_PYTHON to a python that can import torch.)"
   fi
-  echo "  kv cache  : $KV | slots: $PARALLEL | step: $STEP | long prompt fills ${FILL}%"
+  echo "  kv cache  : $KV | slots: $PARALLEL | step: $STEP | winner validated at ${FILL}% fill"
   echo "  cuda      : CUDA_MODULE_LOADING=$CUDA_LOADING | -ngl $NGL"
   echo "  attention : flash_attn=$FLASH_ATTN"
   echo
@@ -398,7 +416,8 @@ else
   emit "$MIN" "$v" "$p" "$pre" "$gen" "$fl"; record "$MIN" "$v" "$p" "$pre" "$gen" "$fl"
   if [[ "$v" != PASS ]]; then
     (( JSON == 0 )) && { echo; echo "Even the minimum ($MIN) does not run. Try a smaller quant or --kv q4_0."; }
-    [[ $JSON == 1 ]] && echo "{\"model\":\"$(basename "$MODEL")\",\"max_context\":0}"
+    [[ $JSON == 1 ]] && printf '{"schema": 2, "model": "%s", "max_context": 0, "validated_at_fill": false}\n' \
+      "$(basename "$MODEL")"
     exit 2
   fi
   lo=$MIN; BEST=$MIN; BEST_PRE=$pre; BEST_GEN=$gen; BEST_PEAK=$p
@@ -428,19 +447,41 @@ fi
 # Validate the winner once at full length. The search deliberately skipped that
 # rung, and this is also the independent second run of BEST — cost is +1 boot,
 # not xN, which is enough to catch an outside disturbance during the search.
+#
+# Backing off is capped at two steps. Walking down until something passes would
+# turn "+1 boot" into an unbounded search, and more than a step or two means the
+# ladder and the full-length prompt genuinely disagree about the ceiling — which
+# is a finding to report, not a number to keep hunting for.
+VALIDATED=0
 if (( BEST > 0 )); then
   (( JSON == 0 )) && { echo; echo "Validating $BEST at ${FILL}% fill..."; }
-  while (( BEST >= STEP )); do
+  # Stepping down happens at the top of the next attempt, not after a failure,
+  # so BEST always names a size that was actually booted — never one that the
+  # loop skipped past on its way out.
+  for _try in 1 2 3; do
+    if (( _try > 1 )); then
+      (( BEST - STEP >= STEP )) || break
+      BEST=$(( BEST - STEP ))
+      (( JSON == 0 )) && echo "  backing off one step, retrying at $BEST"
+    fi
     IFS=$'\t' read -r v p pre gen fl < <(try_ctx "$BEST" full)
     record "$BEST" "final:$v" "$p" "$pre" "$gen" "$fl"
+    (( JSON == 1 )) && printf '  validate %s: %s\n' "$BEST" "$v" >&2
     if [[ "$v" == PASS ]]; then
-      BEST_PEAK=$p; BEST_PRE=$pre; BEST_GEN=$gen
+      BEST_PEAK=$p; BEST_PRE=$pre; BEST_GEN=$gen; VALIDATED=1
       (( JSON == 0 )) && echo "  confirmed: $BEST ($fl tokens filled)"
       break
     fi
-    (( JSON == 0 )) && echo "  $BEST failed at full length ($v) — backing off one step"
-    BEST=$(( BEST - STEP ))
+    (( JSON == 0 )) && echo "  $BEST failed at ${FILL}% fill ($v)"
   done
+  if (( VALIDATED == 0 )); then
+    (( JSON == 0 )) && {
+      echo "  still failing at ${FILL}% fill after backing off."
+      echo "  The ladder stops at 4096 tokens, so this is a size only a near-full"
+      echo "  prompt breaks — no such case has been measured before. Re-run with"
+      echo "  --keep --list \"$BEST\" and read the log; it is the interesting one."
+    }
+  fi
 fi
 
 (( KEEP == 0 )) && find "$OUT" -name 'ctx*.log' -delete 2>/dev/null
@@ -448,16 +489,19 @@ fi
 if (( JSON == 1 )); then
   python3 - "$MODEL" "$GPU_NAME" "$BEST" "$BEST_PEAK" "$BEST_PRE" "$BEST_GEN" \
            "$KV" "$PARALLEL" "$VRAM_TOTAL" "${VRAM_USABLE:-}" "$NGL" "$FILL" \
-           "$CUDA_LOADING" "$VRAM_BASE" "$FLASH_ATTN" <<'PY'
+           "$CUDA_LOADING" "$VRAM_BASE" "$FLASH_ATTN" "$VALIDATED" <<'PY'
 import json, os, sys
 (m, gpu, best, peak, pre, gen, kv, par, total, usable,
- ngl, fill, cuda_loading, free, flash_attn) = sys.argv[1:16]
+ ngl, fill, cuda_loading, free, flash_attn, validated) = sys.argv[1:17]
 print(json.dumps({
     # Bump when the shape of this object changes, so collected results stay
     # interpretable once several machines have contributed.
-    "schema": 1,
+    "schema": 2,
     "model": os.path.basename(m), "gpu": gpu,
     "max_context": int(best),
+    # False means the search ladder cleared this size but a prompt filling
+    # fill_percent of the window did not. max_context is then unconfirmed.
+    "validated_at_fill": validated == "1",
     "peak_vram_mib": int(peak) if peak else None,
     "prefill_tps": float(pre) if pre else None,
     "generate_tps": float(gen) if gen else None,
@@ -474,7 +518,12 @@ else
   echo
   if (( BEST > 0 )); then
     SAFE=$(( BEST - 2 * STEP )); (( SAFE < STEP )) && SAFE=$BEST
-    echo "Largest context that actually runs: $BEST tokens"
+    if (( VALIDATED == 1 )); then
+      echo "Largest context that actually runs: $BEST tokens"
+    else
+      echo "Largest context that cleared the ladder: $BEST tokens (UNCONFIRMED)"
+      echo "  it did not survive a prompt filling ${FILL}% of the window"
+    fi
     echo "  peak VRAM ${BEST_PEAK:-?} MiB | prefill ${BEST_PRE:-?} tok/s | generate ${BEST_GEN:-?} tok/s"
     echo
     echo "That is a ceiling, not a recommendation: it passed at ${FILL}% fill with"
@@ -496,16 +545,18 @@ else
     echo "No context size passed."
   fi
   echo
-  echo "PASS      cleared the search ladder: 64, 512, 4096 tokens"
-  echo "          (only the winner is re-tested at ${FILL}% of the window)"
-  echo "LONG_OOM  a short prompt was fine but a longer one crashed it — the gap"
-  echo "          that makes load-time estimates insufficient"
-  echo "SILENT    ran without crashing but produced no tokens; usually a thinking"
-  echo "          model spending its budget on reasoning, not a memory problem"
+  echo "PASS         cleared the prompt ladder — 64, 512 and 4096 tokens, or as"
+  echo "             many of those rungs as the window holds. Only the winner is"
+  echo "             re-tested at ${FILL}% of the window"
+  echo "LOAD_FAIL    never became healthy; the model or its KV cache didn't fit"
+  echo "DECODE_OOM   loaded, then died on the 18-token warm-up prompt"
+  echo "PREFILL_OOM  died on a ladder rung; FILLED says which one. Usually 64"
+  echo "             tokens, not a long prompt — see docs/gotchas.md"
+  echo "SILENT       ran without crashing but produced no tokens; usually a"
+  echo "             thinking model spending its budget on reasoning, not memory"
   echo
-  echo
-  echo "Speeds in the table come from the 4096-token rung, so they describe a"
-  echo "lightly-loaded window. The figures reported for the winner above come"
+  echo "Speeds in the table come from the last rung a run reached, so they"
+  echo "describe a lightly-loaded window. The figures for the winner above come"
   echo "from the ${FILL}% validation and are the ones to quote."
   echo
   echo "Per-run data: $RESULTS_TSV"

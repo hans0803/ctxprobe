@@ -65,7 +65,8 @@ Two caveats worth stating in any report produced this way:
 - **The driver reserve differs.** A 16GB card here reserves 462 MiB; an 8GB card
   reserves less. Targeting 7800 MiB free is an estimate, and a conservative one.
 - **`nvidia-smi` figures include the holding process.** Subtract it to get the
-  model's own usage. `ctxprobe` reports free VRAM separately for this reason.
+  model's own usage. `ctxprobe` reports what other processes hold as its own
+  header line for this reason.
 
 ## What the 8GB case actually showed
 

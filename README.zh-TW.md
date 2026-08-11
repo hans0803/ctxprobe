@@ -5,8 +5,8 @@
 **估算器告訴你這個 context「應該」裝得下，ctxprobe 證明它真的跑得動。**
 
 找出一張顯卡上，GGUF 模型**實際**能運作的最大 context —— 方法是真的把它啟動、
-用真實長度的 prompt 灌滿視窗、確認它沒有掛掉。一支 bash 腳本，除了
-`llama-server` 和 `python3` 之外沒有其他相依。
+用逐級加長的 prompt 爬到第一個殺死它的長度、再用灌滿的視窗驗證倖存者。
+一支 bash 腳本，除了 `llama-server` 和 `python3` 之外沒有其他相依。
 
 ```bash
 # 不指定範圍時，會從 2048 一路搜尋到模型的訓練 context 上限；
@@ -21,7 +21,7 @@ RTX 5060 Ti 16GB 的實際輸出：
   gpu       : NVIDIA GeForce RTX 5060 Ti
   vram      : 16311 MiB reported by nvidia-smi, 15 MiB already in use
               15849 MiB actually allocatable (462 MiB is driver reserve)
-  kv cache  : q8_0 | slots: 1 | step: 256 | long prompt fills 95%
+  kv cache  : q8_0 | slots: 1 | step: 256 | winner validated at 95% fill
   cuda      : CUDA_MODULE_LOADING=LAZY (default) | -ngl 999
   attention : flash_attn=on (forced by quantised V cache)
 
@@ -32,7 +32,7 @@ CONTEXT    RESULT      PEAK_VRAM   PREFILL    GENERATE   FILLED
 34816      PASS        15845       968.55     28.55      4042
 35840      DECODE_OOM  15805       n/a        n/a        —
 35328      DECODE_OOM  15787       n/a        n/a        —
-35072      LONG_OOM    15847       94.03      26.47      died@64
+35072      PREFILL_OOM 15847       94.03      26.47      died@64
 
 Validating 34816 at 95% fill...
   confirmed: 34816 (32826 tokens filled)
@@ -70,12 +70,13 @@ CUDA 12 是在第一次被碰到時才載入 kernel 程式碼，
 
 RTX 5060 Ti（16 GB）、Qwen3.6-27B-IQ4_XS + q8_0 KV 的實測：
 
-| Context | 載入 | 短 prompt | 30K token 的 prompt |
+| Context | 載入 | 18-token prompt | 64-token prompt |
 |---|---|---|---|
 | 34816 | 成功 | 25.99 tok/s | **正常運作** |
 | 35072 | 成功 | 25.98 tok/s | **CUDA OOM，服務崩潰** |
 
-35072 載入完全正常、生成速度也是滿的。然後一個真實長度的 prompt 就殺了它：
+35072 載入完全正常、生成速度也是滿的。然後一個 **64 token** 的 prompt 就殺了它 ——
+不是長 prompt、不是灌滿視窗的 prompt，就是六十四個 token：
 
 ```
 launch_mul_mat_q at mmq.cuh:1375
@@ -83,12 +84,13 @@ cudaFuncSetAttribute(mul_mat_q<type, J, false>, cudaFuncAttributeMaxDynamicShare
 CUDA error: out of memory
 ```
 
-**長 prompt 會用到短 prompt 從來碰不到的 CUDA kernel。**
+**較大的 prefill 會用到較小的 prefill 從來碰不到的 CUDA kernel。**
 llama.cpp 的量化矩陣乘法是以 batch 形狀作為模板參數的，
-所以較大的 prefill 會實例化另一個 `mul_mat_q` variant ——
+所以較大的 batch 會實例化另一個 `mul_mat_q` variant ——
 而在 CUDA 的 lazy module loading（CUDA 12 之後的預設）之下，
 第一次觸碰某個 kernel 才會把它的程式碼載入 device memory。
 顯存見底時，失敗的就是這個載入。
+切換點來自 `MMQ_DP4A_MAX_BATCH_SIZE`，也就是 64。
 
 注意這**不是**「推論過程中配置量成長」。
 以 50 ms 為間隔對完整的 prefill 與 decode 取樣，顯存從頭到尾都停在 15845 MiB。
@@ -121,13 +123,18 @@ prompt 階梯就是利用這一點：依序爬 64 → 512 → 4096 → 完整長
 第一次死亡就停 —— 註定失敗的 config 幾秒內就被淘汰，
 而不是等一次 30K token 的 prefill 跑完。
 
-因此 `PASS` 的定義是：撐過一個**灌滿視窗 95%** 的 prompt，而且真的吐得出 token。
-這個百分比是量出來的、不是估的 —— 長度透過伺服器自己的
+所以搜尋階段的 `PASS` 代表：爬完了每一階，而且真的吐得出 token。
+接著**只有勝出者**會重新啟動一次，餵一個灌滿視窗 95% 的 prompt ——
+最後回報的那個數字仍然由完整長度的 prompt 背書，
+而這第二次啟動同時也是對這個上限的一次獨立重測。
+
+那個 95% 是量出來的、不是估的 —— 長度透過伺服器自己的
 `/v1/chat/completions/input_tokens` 端點迭代逼近，所以連 chat template 的包裝都算進去了，
 而那層包裝正好就是把「接近滿」的 prompt 推過界的元兇。
-`FILLED` 欄位回報的就是實際灌進去的 prompt 大小。
+`FILLED` 欄位回報的是實際灌進去的 prompt 大小，失敗時則是 `died@N`，
+指出殺死這一輪的是哪一階。
 
-只要求回傳 8 個 token。要證明的是「在那個深度下 prefill 撐得住、模型還開得了口」，
+只要求回傳 8 個 token。要證明的是「prefill 撐得住、模型還開得了口」，
 而不是它寫得多快。
 
 ## 從這裡開始
@@ -173,8 +180,9 @@ cparams.n_ctx = GGML_PAD(cparams.n_ctx, 256);
 所以 `-c 35000` 會被靜靜變成 35072。用 1024 當步進（很自然的習慣）每一階會跳過
 三個可測的點；ctxprobe 預設步進是 256。
 
-另外三個坑收在 [gotchas.zh-TW.md](docs/gotchas.zh-TW.md)：
-thinking 模型回傳空輸出、桌面程序佔住顯卡、子程序已死卻仍被回報為健康。
+另外四個坑收在 [gotchas.zh-TW.md](docs/gotchas.zh-TW.md)：
+為什麼 `PEAK_VRAM` 永遠告訴不了你什麼快要失敗、thinking 模型回傳空輸出、
+桌面程序佔住顯卡、子程序已死卻仍被回報為健康。
 
 ## 用法
 
@@ -188,13 +196,23 @@ ctxprobe MODEL.gguf [選項] [-- 額外的 llama-server 參數]
   --parallel N   server slot 數（預設 1）
   --ngl N        放上 GPU 的層數（預設 999 = 全部；調低會溢出到系統記憶體）
   --list "A B C" 直接測這些數值，不做二分搜尋
-  --fill PCT     長 prompt 要灌多滿（預設 95，由伺服器 tokenizer 實測）
-  --json         機器可讀的輸出
+  --fill PCT     勝出者的驗證 prompt 要灌多滿（預設 95，由伺服器 tokenizer 實測）
+  --eager        CUDA_MODULE_LOADING=EAGER —— 較小、但不取決於
+                 「這一輪剛好碰到哪些 kernel」的上限
+  --port N       探測用伺服器的 port（預設 6099）
+  --out DIR      log 與 results.tsv 的存放位置（預設 ./ctxprobe-out）
+  --json         機器可讀的輸出（進度輸出到 stderr）
   --keep         保留每一輪的 log
 ```
 
-預設用二分搜尋，所以找出上限只需要約 log₂(範圍) 次啟動，而不是每個候選值各跑一次。
-每次啟動都要重新載入模型，所以請預期會花上幾分鐘。
+預設用二分搜尋，所以找出上限只需要約 log₂(範圍) 次啟動，而不是每個候選值各跑一次，
+最後再加一次啟動來用完整長度驗證勝出者。
+每次啟動都要重新載入模型；但因為有階梯，註定失敗的尺寸幾秒內就被淘汰，
+而不是等一次 30K token 的 prefill 跑完 ——
+上面那次搜尋因此是不到兩分鐘，而不是十五分鐘。
+
+每一次執行都會在 `--out` 底下寫出 `results.tsv`，每次啟動一行，
+驗證那一行以 `final:` 標記。
 
 額外的 `llama-server` 參數放在 `--` 後面直接傳遞：
 
@@ -216,6 +234,7 @@ ctxprobe MODEL.gguf [選項] [-- 額外的 llama-server 參數]
 
 | GPU | 模型 | 量化 | KV | 最大 context | Prefill | 生成 |
 |---|---|---|---|---|---|---|
+| RTX 5060 Ti 16GB | Gemma4-26B-A4B | QAT q4_0 | q8_0 | **105,984** | 1890 tok/s | 50.8 tok/s |
 | RTX 5060 Ti 16GB | Qwen3.6-27B | IQ4_XS | q8_0 | 34,816 | 858 tok/s | 24.6 tok/s |
 | RTX 5060 Ti 16GB | Qwen3.6-27B | IQ4_XS | f16 | 20,224 | 923 tok/s | 26.9 tok/s |
 | RTX 5060 Ti 8GB *(模擬)* | Qwen3.6-27B | IQ4_XS | q8_0 | 4,096 † | 391 tok/s | 5.11 tok/s |
