@@ -102,6 +102,56 @@ Generation holds up better under load too: 120 tok/s on an empty window against
 here, which is consistent with 5 full-attention layers still having to attend
 over a 100K cache.
 
+## Spilling to an 8GB card
+
+Constrained to a real 8GB card's budget (7799 MiB free, see
+[spill-cost.md](../docs/spill-cost.md) for why a 16GB 5060 Ti can stand in for
+the 8GB one):
+
+| Method | Fits? | Generate |
+|---|---|---|
+| **`--cpu-moe`** (experts in RAM) | **yes — 2.4 GB of VRAM** | **39.7 tok/s** |
+| `--n-cpu-moe 15` (half the layers) | no | — |
+| `-ngl 20` (dense-style, control) | no | — |
+
+**`-ngl` is the wrong tool for a MoE model.** Every layer contains experts, so
+cutting layers doesn't remove the bulk. Moving experts by tensor type does:
+weights drop from 14.44 GB to about 2.4 GB.
+
+With that much VRAM freed, the 8GB card runs **131,072 context** — the tool's
+search cap, not the model's limit — at 612 tok/s prefill and 24.6 tok/s generate.
+A 26B model, on 8GB, at 128K context.
+
+### Why it isn't slower
+
+At 39.7 tok/s with experts in system RAM, the obvious question is how a 4B-active
+model sustains that across DDR4. The routing config answers it:
+
+```
+expert_count       = 128
+expert_used_count  = 8      <- top-8 routing
+expert_ff_length   = 704
+```
+
+Each expert is `3 × 2816 × 704 = 5.95M` parameters (gate, up, down); at q4_0's
+18 bytes per 32 weights that is 3.19 MiB. Per token the model activates
+30 layers × 8 experts = 240 of them:
+
+```
+240 × 3.19 MiB   = 0.80 GB per token
+39.7 tok/s × 0.80 GB = 31.9 GB/s
+```
+
+Measured DDR4 bandwidth on this host: 43.1 GB/s copy (read+write), 27.0 GB/s
+single-threaded read. So 31.9 GB/s is close to saturation — **it is bandwidth
+bound**, exactly as expected.
+
+The reason it feels faster than "4B active over DDR4" predicts is that only
+**1.43B of those 4B are experts**. The other ~2.6B — attention, shared layers,
+embeddings — never leave the GPU. MoE's advantage here isn't only that few
+parameters are active; it's that the parameters which *are* sparse happen to be
+the ones you can evict.
+
 ## Reproducing
 
 ```bash

@@ -100,6 +100,58 @@ context 的差距則來自 sliding-window attention。
 這裡的相對跌幅大得多，這與「5 層 full attention 仍必須對著 100K 的 cache 做注意力」
 是一致的。
 
+## 溢出到 8GB 卡
+
+限制在真實 8GB 卡的預算下（剩餘 7799 MiB，
+為什麼 16GB 的 5060 Ti 可以代表 8GB 版本見
+[spill-cost.zh-TW.md](../docs/spill-cost.zh-TW.md)）：
+
+| 方法 | 裝得下？ | 生成 |
+|---|---|---|
+| **`--cpu-moe`**（expert 放系統記憶體） | **可以 —— 只用 2.4 GB 顯存** | **39.7 tok/s** |
+| `--n-cpu-moe 15`（一半的層） | 不行 | — |
+| `-ngl 20`（dense 式，對照組） | 不行 | — |
+
+**`-ngl` 對 MoE 模型是錯的工具。** 每一層都含有 expert，
+所以按層砍並不會把大宗移走。按張量類型搬移才有效：
+權重從 14.44 GB 掉到約 2.4 GB。
+
+騰出這麼多顯存之後，這張 8GB 卡跑得動 **131,072 context** ——
+那是工具的搜尋上限，不是模型的極限 ——
+prefill 612 tok/s、生成 24.6 tok/s。
+一個 26B 模型，在 8GB 上，128K context。
+
+### 為什麼沒有更慢
+
+expert 放在系統記憶體卻還有 39.7 tok/s，
+很自然會問一個 4B active 的模型怎麼可能撐得住 DDR4。
+路由設定給出答案：
+
+```
+expert_count       = 128
+expert_used_count  = 8      <- top-8 路由
+expert_ff_length   = 704
+```
+
+每個 expert 是 `3 × 2816 × 704 = 5.95M` 個參數（gate、up、down）；
+以 q4_0 每 32 個權重 18 bytes 計算就是 3.19 MiB。
+每個 token 啟用 30 層 × 8 個 expert = 240 個：
+
+```
+240 × 3.19 MiB       = 每個 token 0.80 GB
+39.7 tok/s × 0.80 GB = 31.9 GB/s
+```
+
+這台主機實測的 DDR4 頻寬：copy 43.1 GB/s（讀+寫）、
+單執行緒讀取 27.0 GB/s。
+所以 31.9 GB/s 已經接近飽和 —— **它就是頻寬受限**，跟預期一致。
+
+之所以感覺比「4B active 過 DDR4」該有的速度快，
+是因為那 4B 裡**只有 1.43B 是 expert**。
+其餘約 2.6B —— attention、shared 層、embedding —— 從來沒有離開 GPU。
+MoE 在這裡的優勢不只是「啟用的參數少」，
+而是「稀疏的那部分剛好就是可以外放的那部分」。
+
 ## 復現方式
 
 ```bash

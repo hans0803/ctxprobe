@@ -93,8 +93,22 @@ It isn't always the wrong call:
   tolerable for your use. Reading speed is roughly 5-10 tok/s, so this is not
   automatically unusable — it's unusable for anything agentic or long-form.
 - **MoE models.** Only a fraction of the parameters are active per token, so
-  keeping experts in system RAM (`--n-cpu-moe`) costs far less than spilling
-  dense layers. That is a genuinely different trade, not the one measured here.
+  keeping experts in system RAM costs far less than spilling dense layers.
+  Measured on the same simulated 8GB card:
+
+  | Model | Method | Fits? | Generate |
+  |---|---|---|---|
+  | Gemma4-26B-A4B (MoE) | `--cpu-moe` | yes, 2.4 GB of VRAM | **39.7 tok/s** |
+  | Qwen3.6-27B (dense) | `-ngl 28` | 28 of 65 layers | 5.1 tok/s |
+
+  **Nearly 8× faster**, and it isn't close. The MoE model also leaves most of
+  the card free, because moving the experts out drops the weights from 14.4 GB
+  to 2.4 GB.
+
+  **Use the right flag, though.** `-ngl` is the wrong tool for MoE: every layer
+  contains experts, so cutting layers doesn't remove the bulk. On the same card
+  both `-ngl 20` and `--n-cpu-moe 15` failed to load, while `--cpu-moe` — which
+  moves experts by tensor type rather than by layer — had room to spare.
 
 What isn't fine is spilling *by accident* — which is the common case, because
 nothing announces it. Check the layer count in the startup log, or run
