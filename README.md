@@ -180,9 +180,11 @@ cparams.n_ctx = GGML_PAD(cparams.n_ctx, 256);
 So `-c 35000` silently becomes 35072. Searching in steps of 1024 (a natural
 habit) skips three testable points every step; ctxprobe's default step is 256.
 
-Four more are in [gotchas.md](docs/gotchas.md): why `PEAK_VRAM` can never tell
-you what is about to fail, thinking models returning empty output, desktop
-processes squatting on the card, and dead children still being reported healthy.
+Seven more are in [gotchas.md](docs/gotchas.md): why a short prompt cannot
+qualify a context size, why `PEAK_VRAM` can never tell you what is about to
+fail, thinking models returning empty output, `n_ubatch` 512 as a bad MoE
+default, `--tensor-split` failing to place MoE experts, desktop processes
+squatting on the card, and short generations that look like findings.
 
 ## Usage
 
@@ -246,7 +248,9 @@ Without torch everything still works, you just don't get that line.
 
 ‡ 136.66 GB model, experts in DDR5 via `--cpu-moe`; the ceiling is ctxprobe's
 search cap, and it is ladder-verified but not fill-validated. Prefill quoted at
-`-ub 8192`; the default 512 gives 151 tok/s.
+`-ub 8192`; the default 512 gives 151 tok/s. **This row needs 192 GB of system
+RAM and only 12.3 GB of VRAM** — the card is the cheap half. Generate is 13.3 on
+all 32 threads, 12.07 with 2 held back for other services.
 
 The first two rows are the same model on the same card, one flag apart. Full run,
 including how the ceiling moved as VRAM was freed:

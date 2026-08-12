@@ -119,7 +119,7 @@ llama-server ... --reasoning-budget 0
 
 Benchmarks that only look at tokens/s won't notice; ones that check output will.
 
-## 8. `n_ubatch` 512 is a bad default for sparse MoE
+## 7. `n_ubatch` 512 is a bad default for sparse MoE
 
 Prefill reads experts once per ubatch. With top-6-of-256 routing, a 512-token
 batch collectively touches nearly every expert, so **each ubatch drags the whole
@@ -144,7 +144,7 @@ which is also what makes this measurable cleanly.
 This only matters when experts are on the far side of a slow link. A dense model
 fully in VRAM has no equivalent cliff.
 
-## 9. `--tensor-split` cannot fix uneven MoE placement
+## 8. `--tensor-split` cannot fix uneven MoE placement
 
 The instinct when one card fills up and the other sits idle is to reach for
 `--tensor-split`. On a MoE model with experts offloaded, it does nothing:
@@ -174,10 +174,11 @@ joining patterns with commas (the greedy `.*` eats the separator and matches
 nothing). Neither errors — the tell is VRAM sitting at the no-experts-on-GPU
 baseline while generation stays at the all-CPU figure.
 
-Worth knowing before buying a second card: doing this correctly bought +18%
-generation, against 5.1x prefill from raising `n_ubatch` alone.
+Worth knowing before buying a second card: doing this correctly bought a measured
++23% prefill and **no demonstrable generation gain at all**, against 5.1x prefill
+from raising `n_ubatch` alone.
 
-## 10. Desktop processes squat on the discrete GPU
+## 9. Desktop processes squat on the discrete GPU
 
 Two separate offenders, worth ~590 MiB together on our box:
 
@@ -198,6 +199,43 @@ Verify anything that claims to have moved:
 ```bash
 grep -cE 'libcuda|libnvidia-encode' /proc/<pid>/maps   # want 0
 ```
+
+## 10. A short generation is not a tok/s measurement
+
+The mirror of #4. A generation long enough to exercise the decode path is not
+long enough to time it.
+
+Sweeping expert placement for DeepSeek-V4-Flash, sampling 32 generated tokens
+per configuration:
+
+| Expert layers on GPU | Generate |
+|---|---|
+| 13 | 15.86 |
+| 14 | 13.70 |
+| 15 | 14.34 |
+| 16 | 13.38 |
+
+More VRAM, less speed, no ordering — a table that demands an explanation, and
+one is easy to invent (routing is per-token, so surely throughput varies with
+what the model happens to generate). Three repeats at **256** tokens on the same
+hardware:
+
+```
+12.09   12.04   12.07      <- ±0.2%
+```
+
+The scatter was the sample. At 32 tokens, per-request setup and the first-token
+path are still a visible fraction of a window that llama.cpp averages over
+whole, and the residual is the same size as the effect being measured.
+
+The cost is not the wasted run. It is that a noisy table looks like a finding,
+and the explanation you reach for will feel mechanistic and survive review —
+[the DeepSeek-V4-Flash writeup](../results/rtx5090-32gb-deepseek-v4-flash.md)
+carried exactly that error for a day. Prefill is not affected the same way; it
+is timed over thousands of tokens by construction.
+
+Use 256 tokens and at least three repeats before reading anything into a
+difference under 10%.
 
 ---
 

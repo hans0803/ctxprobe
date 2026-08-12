@@ -180,9 +180,11 @@ cparams.n_ctx = GGML_PAD(cparams.n_ctx, 256);
 所以 `-c 35000` 會被靜靜變成 35072。用 1024 當步進（很自然的習慣）每一階會跳過
 三個可測的點；ctxprobe 預設步進是 256。
 
-另外四個坑收在 [gotchas.zh-TW.md](docs/gotchas.zh-TW.md)：
+另外七個坑收在 [gotchas.zh-TW.md](docs/gotchas.zh-TW.md)：
+為什麼短 prompt 認證不了一個 context 大小、
 為什麼 `PEAK_VRAM` 永遠告訴不了你什麼快要失敗、thinking 模型回傳空輸出、
-桌面程序佔住顯卡、子程序已死卻仍被回報為健康。
+`n_ubatch` 512 對 MoE 是個糟糕的預設、`--tensor-split` 放不好 MoE expert、
+桌面程序佔住顯卡、以及看起來像發現的短生成量測。
 
 ## 用法
 
@@ -246,6 +248,8 @@ ctxprobe MODEL.gguf [選項] [-- 額外的 llama-server 參數]
 ‡ 136.66 GB 的模型，expert 透過 `--cpu-moe` 放在 DDR5；
 這個上限是 ctxprobe 的搜尋上限，而且只通過階梯驗證、未做填充驗證。
 Prefill 是 `-ub 8192` 的數字；預設的 512 只有 151 tok/s。
+**這一行需要 192 GB 系統記憶體，卻只需要 12.3 GB 顯存** —— 顯卡是便宜的那一半。
+生成 13.3 是用滿 32 執行緒；留 2 個核心給其他服務時是 12.07。
 
 前兩行是同一個模型、同一張卡，只差一個參數。完整的實測過程
 （包含騰出顯存後上限怎麼往上跳）在
