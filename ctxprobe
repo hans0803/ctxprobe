@@ -89,7 +89,7 @@ mkdir -p "$OUT"
 # Everything must report the GPU this run actually uses. Taking index 0 blindly
 # reads another card's usage on a multi-GPU box, which silently invalidates
 # every VRAM figure below.
-GPU_IDX="${CUDA_VISIBLE_DEVICES%%,*}"; GPU_IDX="${GPU_IDX:-0}"
+GPU_IDX="${CUDA_VISIBLE_DEVICES-}"; GPU_IDX="${GPU_IDX%%,*}"; GPU_IDX="${GPU_IDX:-0}"
 smi() { nvidia-smi -i "$GPU_IDX" "$@"; }
 VRAM_TOTAL=$(smi --query-gpu=memory.total --format=csv,noheader,nounits | head -1)
 VRAM_BASE=$(smi --query-gpu=memory.used --format=csv,noheader,nounits | head -1)
