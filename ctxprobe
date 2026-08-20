@@ -97,11 +97,13 @@ read_usable() {
   # Must be cudaMemGetInfo, which is what CUDA will actually hand out.
   # NVML/nvidia-smi report the physical size of the board instead — using those
   # yields a driver reserve of 0 and hides the very gap this is here to expose.
-  # Reports free as well as total: they diverge whenever something else already
-  # holds memory on the card, and it is free that bounds this run.
+  # Only the total is wanted. The free figure this call also returns is measured
+  # from inside a CUDA context that torch had to create, and that context holds
+  # ~135 MiB on an idle 16 GB card — it would be reported as somebody else's
+  # usage even though it is gone before llama-server starts. What other
+  # processes hold comes from nvidia-smi instead, at the point of use below.
   local snippet='import torch
-f, t = torch.cuda.mem_get_info()
-print(int(f / 2**20), int(t / 2**20))'
+print(int(torch.cuda.mem_get_info()[1] / 2**20))'
   local py
   for py in "${CTXPROBE_PYTHON:-}" python3 \
             "$HOME/miniconda3/envs/"*/bin/python "$HOME/venv/bin/python" ; do
@@ -111,9 +113,8 @@ print(int(f / 2**20), int(t / 2**20))'
   done
   return 1
 }
-VRAM_INFO=$(read_usable || true)
-VRAM_FREE=${VRAM_INFO% *}; VRAM_USABLE=${VRAM_INFO#* }
-[[ "$VRAM_INFO" == *" "* ]] || { VRAM_FREE=""; VRAM_USABLE=""; }
+VRAM_USABLE=$(read_usable || true)
+[[ "$VRAM_USABLE" =~ ^[0-9]+$ ]] || VRAM_USABLE=""
 GPU_NAME=$(smi --query-gpu=name --format=csv,noheader | head -1)
 # Lazy vs eager module loading decides when a kernel's code is pulled into VRAM,
 # which moves the ceiling. Two machines set differently give different answers,
