@@ -172,6 +172,10 @@ This also makes the prompt ladder's rungs meaningful rather than round: 64 is
 `MMQ_DP4A_MAX_BATCH_SIZE`, 512 is `n_ubatch`, 4096 clears `n_batch` (2048).
 Every failure measured so far lands on one of the first two.
 
+**Superseded 2026-08-20.** The third rung has since caught one: Qwen3.8-27B
+`UD-Q4_K_S` with f16 KV at 19,968 cleared 64 and 512 and died on 4,024 tokens.
+See [rtx5060ti-16gb-qwen3.8-27b.md](rtx5060ti-16gb-qwen3.8-27b.md).
+
 ## Prefill vs prompt length
 
 Measured against the deployed 34,816 config. Each prompt is randomly generated

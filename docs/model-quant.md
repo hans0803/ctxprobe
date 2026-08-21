@@ -50,6 +50,47 @@ The letters:
   weights to protect, so it holds up better than its bit count suggests. `IQ4_XS`
   punches noticeably above 4.25 bits.
 
+## The name does not fix the bits
+
+The table above is approximate on purpose. Two files can carry the same quant
+name and still differ by half a bit per weight, because "dynamic" builds — the
+`UD-` prefix from Unsloth, and equivalents elsewhere — assign precision per
+tensor rather than applying one scheme everywhere.
+
+Bits per weight computed from ggml's actual block sizes, for two releases of
+the same architecture:
+
+| | Params | Tensor bytes | **bpw** |
+|---|---|---|---|
+| Qwen3.6-27B `IQ4_XS` | 26.90 B | 14,714 MiB | **4.5892** |
+| Qwen3.8-27B `UD-IQ4_XS` | 27.32 B | 13,582 MiB | **4.1703** |
+| Qwen3.8-27B `UD-Q4_K_S` | 27.32 B | 14,636 MiB | **4.4939** |
+
+The middle row has *more* parameters in a *smaller* file than the top one, and
+its name suggests they are the same thing. It is built from 12 distinct quant
+types against the top row's 4, with 0.80 B parameters below 3 bits and
+`token_embd` dropped from `Q4_K` to `Q3_K`.
+
+**This is not a complaint about the packaging — it is a warning about
+comparison.** On a 16 GB card that 0.42 bpw is worth 27,000 tokens of context,
+so a newer model in a leaner file looks like a large generational improvement
+and isn't. Matched at equal precision, the two land within 1.5% of each other:
+
+| | Ceiling, q8_0 KV |
+|---|---|
+| Qwen3.6 `IQ4_XS` (4.5892 bpw) | 34,816 |
+| Qwen3.8 `UD-IQ4_XS` (4.1703 bpw) | 61,952 |
+| Qwen3.8 `UD-Q4_K_S` (4.4939 bpw) | 34,304 |
+
+Full measurements: [rtx5060ti-16gb-qwen3.8-27b.md](../results/rtx5060ti-16gb-qwen3.8-27b.md).
+
+To check a file before trusting its label, divide: **file bytes × 8 ÷ parameter
+count**. Both numbers are on the Hugging Face model page, and llama.cpp prints
+the parameter count when it loads. 14,252,845,984 × 8 ÷ 27.32 B = 4.17, which is
+enough to tell a 4.2 bpw file from a 4.6 bpw one. The per-tensor breakdown needs
+a GGUF parser, but you rarely need it — the average is what decides whether the
+file fits.
+
 ## Working out what fits
 
 Rough arithmetic, then verify:

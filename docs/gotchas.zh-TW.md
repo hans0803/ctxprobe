@@ -76,6 +76,23 @@ return !fp16_mma_hardware_available(cc) || ne11 < MMQ_DP4A_MAX_BATCH_SIZE;
 這個判定以前叫 `LONG_OOM` —— 那是「相信 buffer 會隨 prompt 長度成長」時期的遺留。
 它們並不會成長，而那個名字會讓人去找一個根本不存在的記憶體洩漏。
 
+**64 不是唯一會觸發的那一階。** 階梯爬 64 → 512 → 4096 是有理由的：
+512 是 `n_ubatch`、也就是第一個完整的微批，4096 則跨過 `n_batch`（2048）。
+三階現在都各自殺掉過真實的 config：
+
+| 配置 | 死在 | 對應 |
+|---|---|---|
+| Qwen3.6-27B `IQ4_XS` q8_0 35,072 | `died@64` | `MMQ_DP4A_MAX_BATCH_SIZE` |
+| Qwen3.8-27B `UD-IQ4_XS` q8_0 62,208 | `died@509` | `n_ubatch` |
+| Qwen3.8-27B `UD-Q4_K_S` f16 19,968 | `died@4024` | `n_batch` |
+
+最後那一個過了 64 **也**過了 512，死在 4,024 個 token 上。
+只做到其中任一階的檢查都會判它通過。
+512 那些失敗還橫跨兩種 KV 型別、因而橫跨兩種 flash attention 狀態
+（`q8_0` 會把 flash attention 釘成開啟，`f16` 停在 `auto`），
+失敗點沒有移動 —— 這把責任指向 ggml 的 memory pool 隨 batch shape 長大，
+而不是 attention 的實作。
+
 相關的一點：子程序這樣死掉之後會變成殭屍程序（defunct），
 而只追蹤自己狀態的上層 gateway 會繼續回報這個部署是健康的。
 要檢查程序，不是檢查狀態端點。

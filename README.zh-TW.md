@@ -122,6 +122,8 @@ llama_init_from_model: failed to allocate compute pp buffers
 prompt 階梯就是利用這一點：依序爬 64 → 512 → 4096 → 完整長度，
 第一次死亡就停 —— 註定失敗的 config 幾秒內就被淘汰，
 而不是等一次 30K token 的 prefill 跑完。
+三個階目前都各自殺掉過真實的 config —— 64 對應 `MMQ_DP4A_MAX_BATCH_SIZE`、
+512 對應 `n_ubatch`、4096 跨過 `n_batch` —— 沒有一階是裝飾。
 
 所以搜尋階段的 `PASS` 代表：爬完了每一階，而且真的吐得出 token。
 接著**只有勝出者**會重新啟動一次，餵一個灌滿視窗 95% 的 prompt ——
@@ -142,10 +144,12 @@ prompt 階梯就是利用這一點：依序爬 64 → 512 → 4096 → 完整長
 單卡上，有兩個設定決定了你大部分的結果：
 
 - **[你該下載哪一個量化？](docs/model-quant.zh-TW.md)** ——
-  看懂 `Q4_K_M` / `IQ4_XS` 這些名字，以及最重要的那條規則：
+  看懂 `Q4_K_M` / `IQ4_XS` 這些名字、為什麼名字決定不了 bits，
+  以及最重要的那條規則：
   「**完整**裝得下的最大量化」勝過「會溢出的更好量化」。
 - **[KV cache：為什麼用 q8_0](docs/kv-cache-quant.zh-TW.md)** ——
-  長 context 上槓桿最大的設定。在這裡，一個參數換到多 72% 的 context。
+  長 context 上槓桿最大的設定。在這裡，一個參數換到多 70~74% 的 context ——
+  不過它省下的是每 token 成本的 40%，不是型別大小暗示的 50%。
 - **[裝不下的時候，代價是什麼](docs/spill-cost.zh-TW.md)** —— 實測：
   溢出 57% 的層會慢五倍，以及怎麼量一張你沒有的顯卡。
 
@@ -240,6 +244,10 @@ ctxprobe MODEL.gguf [選項] [-- 額外的 llama-server 參數]
 | RTX 5060 Ti 16GB | Gemma4-26B-A4B | QAT q4_0 | q8_0 | **105,984** | 1890 tok/s | 50.8 tok/s |
 | RTX 5060 Ti 16GB | Qwen3.6-27B | IQ4_XS | q8_0 | 34,816 | 858 tok/s | 24.6 tok/s |
 | RTX 5060 Ti 16GB | Qwen3.6-27B | IQ4_XS | f16 | 20,224 | 923 tok/s | 26.9 tok/s |
+| RTX 5060 Ti 16GB | Qwen3.8-27B | UD-IQ4_XS § | q8_0 | 61,952 | 740 tok/s | 23.4 tok/s |
+| RTX 5060 Ti 16GB | Qwen3.8-27B | UD-IQ4_XS § | f16 | 36,352 | 825 tok/s | 27.0 tok/s |
+| RTX 5060 Ti 16GB | Qwen3.8-27B | UD-Q4_K_S § | q8_0 | 34,304 | 820 tok/s | 25.0 tok/s |
+| RTX 5060 Ti 16GB | Qwen3.8-27B | UD-Q4_K_S § | f16 | 19,712 | 875 tok/s | 27.2 tok/s |
 | RTX 5060 Ti 8GB *(模擬)* | Qwen3.6-27B | IQ4_XS | q8_0 | 4,096 † | 391 tok/s | 5.11 tok/s |
 
 † 裝不下：65 層中只有 28 層在 GPU 上，其餘在系統記憶體。
@@ -251,7 +259,16 @@ Prefill 是 `-ub 8192` 的數字；預設的 512 只有 151 tok/s。
 **這一行需要 192 GB 系統記憶體，卻只需要 12.3 GB 顯存** —— 顯卡是便宜的那一半。
 生成 13.3 是用滿 32 執行緒；留 2 個核心給其他服務時是 12.07。
 
-前兩行是同一個模型、同一張卡，只差一個參數。完整的實測過程
+§ **量化的名字決定不了 bits。** `UD-IQ4_XS` 是每權重 4.1703 bits，
+Qwen3.6 的 `IQ4_XS` 是 4.5892 —— 同一個名字家族，差 0.42 bpw，
+在這張卡上值 27,000 個 token。拿同精度的來比，Qwen3.8 的 `UD-Q4_K_S`（4.4939）
+在兩種 KV 模式下都比 Qwen3.6 **少** 512 個 token。看起來像世代躍進的東西是打包方式。
+tensor 層級的拆解在
+[rtx5060ti-16gb-qwen3.8-27b.zh-TW.md](results/rtx5060ti-16gb-qwen3.8-27b.zh-TW.md)；
+怎麼在相信標籤之前先驗一個檔案，在
+[model-quant.zh-TW.md](docs/model-quant.zh-TW.md)。
+
+Qwen3.6 那兩行是同一個模型、同一張卡，只差一個參數。完整的實測過程
 （包含騰出顯存後上限怎麼往上跳）在
 [rtx5060ti-16gb-qwen3.6-27b.zh-TW.md](results/rtx5060ti-16gb-qwen3.6-27b.zh-TW.md)。
 

@@ -168,6 +168,10 @@ llama_init_from_model: V cache quantization requires flash_attn
 64 是 `MMQ_DP4A_MAX_BATCH_SIZE`、512 是 `n_ubatch`、4096 跨過 `n_batch`（2048）。
 目前量到的每一次失敗，都精確落在前兩者之一。
 
+**2026-08-20 更新：這句已被推翻。** 第三階後來抓到了一個 ——
+Qwen3.8-27B `UD-Q4_K_S` 配 f16 KV，19,968 過了 64、過了 512，死在 4,024。
+見 [rtx5060ti-16gb-qwen3.8-27b.zh-TW.md](rtx5060ti-16gb-qwen3.8-27b.zh-TW.md)。
+
 ## Prefill 與 prompt 長度的關係
 
 對照已部署的 34,816 配置量測。每個 prompt 都是隨機產生的，

@@ -26,8 +26,9 @@ get 8K of context or 34K.
 ## What quantising it does
 
 By default llama.cpp stores those vectors at 16-bit precision (`f16`). Setting
-`--cache-type-k q8_0 --cache-type-v q8_0` stores them at 8-bit instead: **half
-the memory, for the same number of tokens.**
+`--cache-type-k q8_0 --cache-type-v q8_0` stores them at 8-bit instead — which
+sounds like half the memory for the same number of tokens, and isn't quite; see
+[below](#it-saves-40-not-50).
 
 Measured on an RTX 5060 Ti 16GB with Qwen3.6-27B-IQ4_XS:
 
@@ -49,6 +50,44 @@ is model, leaving only ~400 MiB as cache budget. Halving the per-token cost
 stretches that remainder, not the whole window. **The tighter the model fits, the
 smaller the gain** — which is worth knowing before assuming q8_0 will rescue a
 model that barely loads.
+
+## It saves 40%, not 50%
+
+`q8_0` holds 1.0625 bytes per value against `f16`'s 2, so halving is the natural
+expectation. What a card actually gives up per token is measurably worse than
+that.
+
+Peak VRAM against context is linear enough to read straight off adjacent PASS
+rows. Measured on Qwen3.8-27B, which has 16 full-attention layers with 4 KV
+heads at `head_dim` 256 — 32,768 cache values per token:
+
+| | Theory | Measured | Excess |
+|---|---|---|---|
+| `f16` | 64.0 MiB/1K | **63.48** | ~0 |
+| `q8_0` | 34.0 MiB/1K | **38.09** | **+4.1** |
+
+The f16 slope is the same figure on Qwen3.6, Qwen3.8 `UD-IQ4_XS` and Qwen3.8
+`UD-Q4_K_S`, so it is a property of the architecture and it matches theory.
+`q8_0` does not: it overshoots by 4,198 bytes per token, and one layer's
+per-token KV held at f16 is 4 × 256 × 2 × 2 = 4,096 bytes — a 2.5% match.
+
+The shape of that is a **dequantisation scratch buffer sized for one layer at a
+time, growing linearly with context.** f16 needs no such buffer because nothing
+has to be unpacked.
+
+So the real ratio is 38.09 / 63.48 = **60% of the per-token cost, not 50%**. A
+calculator that divides KV bytes by two will promise you more context than the
+card delivers. Ceilings measured three ways:
+
+| | f16 | q8_0 | Gain |
+|---|---|---|---|
+| Qwen3.6-27B `IQ4_XS` | 20,224 | 34,816 | +72.1% |
+| Qwen3.8-27B `UD-IQ4_XS` | 36,352 | 61,952 | +70.4% |
+| Qwen3.8-27B `UD-Q4_K_S` | 19,712 | 34,304 | +74.0% |
+
+Still the highest-leverage flag available. Just not the factor of two.
+
+Full run: [rtx5060ti-16gb-qwen3.8-27b.md](../results/rtx5060ti-16gb-qwen3.8-27b.md).
 
 ## What it costs
 

@@ -120,7 +120,9 @@ tokens, which is exactly why it needed a long prompt to notice — not because
 filling the window matters, but because 18 tokens sits below the threshold where
 a new kernel variant gets instantiated. The prompt ladder exploits this: it
 climbs 64 → 512 → 4096 → full and stops at the first death, so a doomed config
-is rejected in seconds instead of after a 30K-token prefill.
+is rejected in seconds instead of after a 30K-token prefill. All three rungs
+have now killed a real config — 64 at `MMQ_DP4A_MAX_BATCH_SIZE`, 512 at
+`n_ubatch`, 4096 past `n_batch` — so none of them is decorative.
 
 `PASS` during the search therefore means the run cleared every rung and still
 emitted tokens. The **winner alone** is then re-booted and given a prompt filling
@@ -141,10 +143,13 @@ the model still speaks, not how fast it writes.
 Two settings decide most of the outcome on a single card:
 
 - **[Which quant should you download?](docs/model-quant.md)** — reading
-  `Q4_K_M` / `IQ4_XS` names, and the rule that matters most: the biggest quant
-  that *fits entirely* beats a better one that spills.
+  `Q4_K_M` / `IQ4_XS` names, why the name doesn't fix the bits, and the rule
+  that matters most: the biggest quant that *fits entirely* beats a better one
+  that spills.
 - **[KV cache: why q8_0](docs/kv-cache-quant.md)** — the highest-leverage
-  setting for long context. Worth 72% more context here, for one flag.
+  setting for long context. Worth 70–74% more context here, for one flag —
+  though it saves 40% of the per-token cost rather than the 50% the type sizes
+  imply.
 - **[What it costs when it doesn't fit](docs/spill-cost.md)** — measured: 5×
   slower for spilling 57% of the layers, and how to test a card you don't own.
 
@@ -241,6 +246,10 @@ Without torch everything still works, you just don't get that line.
 | RTX 5060 Ti 16GB | Gemma4-26B-A4B | QAT q4_0 | q8_0 | **105,984** | 1890 tok/s | 50.8 tok/s |
 | RTX 5060 Ti 16GB | Qwen3.6-27B | IQ4_XS | q8_0 | 34,816 | 858 tok/s | 24.6 tok/s |
 | RTX 5060 Ti 16GB | Qwen3.6-27B | IQ4_XS | f16 | 20,224 | 923 tok/s | 26.9 tok/s |
+| RTX 5060 Ti 16GB | Qwen3.8-27B | UD-IQ4_XS § | q8_0 | 61,952 | 740 tok/s | 23.4 tok/s |
+| RTX 5060 Ti 16GB | Qwen3.8-27B | UD-IQ4_XS § | f16 | 36,352 | 825 tok/s | 27.0 tok/s |
+| RTX 5060 Ti 16GB | Qwen3.8-27B | UD-Q4_K_S § | q8_0 | 34,304 | 820 tok/s | 25.0 tok/s |
+| RTX 5060 Ti 16GB | Qwen3.8-27B | UD-Q4_K_S § | f16 | 19,712 | 875 tok/s | 27.2 tok/s |
 | RTX 5060 Ti 8GB *(simulated)* | Qwen3.6-27B | IQ4_XS | q8_0 | 4,096 † | 391 tok/s | 5.11 tok/s |
 
 † Does not fit: only 28 of 65 layers on the GPU, the rest in system RAM. See
@@ -252,8 +261,17 @@ search cap, and it is ladder-verified but not fill-validated. Prefill quoted at
 RAM and only 12.3 GB of VRAM** — the card is the cheap half. Generate is 13.3 on
 all 32 threads, 12.07 with 2 held back for other services.
 
-The first two rows are the same model on the same card, one flag apart. Full run,
-including how the ceiling moved as VRAM was freed:
+§ **The quant name does not fix the bits.** `UD-IQ4_XS` is 4.1703 bits per
+weight against Qwen3.6's `IQ4_XS` at 4.5892 — same label family, 0.42 bpw apart,
+which on this card is worth 27,000 tokens. Compare like for like and Qwen3.8's
+`UD-Q4_K_S` (4.4939) lands 512 tokens *below* Qwen3.6 in both KV modes. The
+apparent generational leap is packaging.
+[rtx5060ti-16gb-qwen3.8-27b.md](results/rtx5060ti-16gb-qwen3.8-27b.md) has the
+tensor-level breakdown; [model-quant.md](docs/model-quant.md) has how to check a
+file before trusting its label.
+
+The two Qwen3.6 rows are the same model on the same card, one flag apart. Full
+run, including how the ceiling moved as VRAM was freed:
 [rtx5060ti-16gb-qwen3.6-27b.md](results/rtx5060ti-16gb-qwen3.6-27b.md).
 
 Speeds come from a window-filling prompt, so they describe a loaded window

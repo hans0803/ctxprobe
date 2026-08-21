@@ -78,6 +78,23 @@ that killed it. It used to be called `LONG_OOM`, which was a leftover from
 believing the buffers grew with prompt length — they don't, and the name sent
 people looking for a memory leak that isn't there.
 
+**64 is not the only rung that fires.** The ladder climbs 64 → 512 → 4096 for a
+reason: 512 is `n_ubatch`, the first full micro-batch, and 4096 clears `n_batch`
+(2048). All three have now killed a real config:
+
+| Config | Died at | Rung |
+|---|---|---|
+| Qwen3.6-27B `IQ4_XS` q8_0 35,072 | `died@64` | `MMQ_DP4A_MAX_BATCH_SIZE` |
+| Qwen3.8-27B `UD-IQ4_XS` q8_0 62,208 | `died@509` | `n_ubatch` |
+| Qwen3.8-27B `UD-Q4_K_S` f16 19,968 | `died@4024` | `n_batch` |
+
+The last one cleared 64 **and** 512 and died on 4,024 tokens. A check that
+stopped at either would have called it a pass. The 512 failures also span both
+KV types and therefore both flash-attention states — `q8_0` pins flash attention
+on, `f16` leaves it at `auto` — and the failure point does not move, which is
+what puts the blame on ggml's memory pool growing against batch shape rather
+than on the attention implementation.
+
 Related: when the child dies this way it becomes a defunct process, and a
 supervising gateway that only tracks its own state will keep reporting the
 deployment as healthy. Check the process, not the status endpoint.
