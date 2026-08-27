@@ -12,8 +12,9 @@
 > 這裡 build 的是 `213df58`。後面有一個實驗對 `llama-mmap.cpp` 加了一行
 > 以環境變數控制的補丁，預設關閉，用到的地方會標出來。
 >
-> **尚未量測：** context 天花板。除非該節另有說明，
-> 速度數字都是在預設的 `n_ubatch` 512 和 f16 KV 之下。
+> 除非該節另有說明，速度數字都是在預設的 `n_ubatch` 512 和 f16 KV 之下。
+> 兩張卡的 context 天花板是夾出來的區間、不是二分到底的 ——
+> 而那一節講的與其說是那個數字，不如說是階梯漏掉了什麼。
 
 ## 硬體
 
@@ -319,6 +320,113 @@ expert 進了顯存之後，DDR5 攤提的問題大部分消失，batch 大小�
 把每層成本外推到 `-ncmoe 0`，`-ub` 512 約 1,700 tok/s ——
 `UD-Q3_K_XL` 全部進兩張卡時預期能到的數字。外推，不是實測。
 
+### 解開 `-ub` 2048 的那個 split
+
+`-ncmoe 4 --tensor-split 26,22`，掃描指向的那個組合：
+
+| ub | GPU 0 | GPU 1 | Prefill | TTFT | 生成 | |
+|---|---|---|---|---|---|---|
+| **2048** | 31,963 | 29,981 | **1,548** | **10.0 s** | 59.3 | PASS |
+| 4096 | 32,099 | 29,975 | — | — | — | PREFILL_OOM，device 0 |
+
+如預測般成立 —— GPU 1 有了空間、2048 載得進去 —— 而且是這一頁最高的 prefill 數字，
+高 1.4%，代價是比 `-ncmoe 2` / `-ub` 1024 少 7 tok/s 的 decode。不值得；1,527 / 66 還是那個配置。
+`-ub` 4096 死在 GPU 0 —— split 之後它成了滿的那張 —— 死在下一節要講的那個配置上。
+
+## 兩張卡的 context 天花板
+
+ctxprobe 在 `-ncmoe 4 --tensor-split 26,22`、f16 KV、`--reasoning-budget 0`、
+`--max 131072`。它的 `PEAK_VRAM` 欄只讀 `CUDA_VISIBLE_DEVICES` 的第一個裝置，所以這裡是 GPU 0。
+
+| Context | 結果 | GPU 0 | Prefill | 生成 | 填充 |
+|---|---|---|---|---|---|
+| 8,192 | PASS | 30,687 | 1,732 | 59.2 | 4,024 |
+| 131,072 | LOAD_FAIL | — | — | — | — |
+| 69,632 | PASS | 31,721 | 1,785 | 59.2 | 4,024 |
+| 100,352 | LOAD_FAIL | — | — | — | — |
+| 84,992 | PASS | 31,985 | 1,821 | 59.6 | 4,024 |
+| 92,672 | PREFILL_OOM | 32,103 | — | — | died@4024 |
+| 88,832 | PASS | 32,053 | 1,823 | 58.0 | 4,024 |
+| 90,624 | PASS | 32,083 | 1,810 | 58.7 | 4,024 |
+| 91,648 | PASS | 32,099 | 1,812 | 59.2 | 4,024 |
+| 92,160 | PASS | 32,107 | 1,819 | 58.8 | 4,024 |
+| 92,416 | PREFILL_OOM | 32,105 | — | — | died@4024 |
+
+然後是真正重要的部分：
+
+```
+Validating 92160 at 95% fill...
+  92160 failed at 95% fill (PREFILL_OOM)      died@87063
+  91904 failed at 95% fill (PREFILL_OOM)      died@86816
+  91648 failed at 95% fill (PREFILL_OOM)      died@86592
+  still failing at 95% fill after backing off.
+  The ladder stops at 4096 tokens, so this is a size only a near-full
+  prompt breaks — no such case has been measured before.
+
+Largest context that cleared the ladder: 91648 tokens (UNCONFIRMED)
+```
+
+**上面那張表裡約 63K 以上的每一個 PASS 都是假的**，而 95% 驗證是唯一說出這件事的東西。
+這個分支從階梯寫好那天就一直在工具裡，從來沒被走到過。這是第一次。
+
+### 壞在哪，以及為什麼階梯看不到
+
+這幾次失敗共用一個 backtrace，而它不是這個專案先前每一次失敗的那一個：
+
+```
+ggml_cuda_op_top_k
+  -> argsort_f32_i32_cuda_cub
+    -> ggml_cuda_pool_vmm::alloc          CUDA error: out of memory
+```
+
+那是 **QSA indexer 的 top-k 選擇**。它替 ubatch 裡的每一個 query 列對每一個已快取的 block
+（每 block `compress_ratio` 4 個 token）打分數、排序、留下 `indexer.top_k` 2048 個。
+分數 tensor、它的 graph buffer、排序的暫存區，全部隨 **n_kv × n_ubatch** 長大 ——
+隨著快取裡已經有多少 context。在 `top_k + compress_ratio − 1` = 2,051 個 token 以下
+選的是全部，QSA 在結構上就是 dense；超過之後，工作集隨視窗裡的每一個 token 長大。
+
+階梯的三階是 64、512、4096。4,096 token 的 prompt **有**走到 sparse 路徑 ——
+但把它配置成 n_kv ≈ 4K 的大小。87K 的 prompt 要 20 倍，在一張只剩 10 MiB 的卡上，
+它在進行到約 5,000 token 時死掉，離 4096 那階通過只有 2.9 秒。
+
+這是這個專案第一次量到**隨 prompt 長度長大**的 buffer。
+[gotcha #4](../docs/gotchas.zh-TW.md) 說它們不會 —— 階梯之所以成立，
+是因為 buffer 跟的是 batch 形狀不是 context —— 對 dense attention 它是對的。
+帶學習型 indexer 的稀疏注意力是例外。這對工具有兩個後果：在這個架構上 4096 那階
+不能當作滿視窗的代理，所以搜尋該把 fill-validated 的天花板二分出來，而不是退兩步就停；
+以及 [DeepSeek-V4-Flash 的 131,072](rtx5090-32gb-deepseek-v4-flash.zh-TW.md) ——
+DSA、階梯驗證過、從未填充驗證 —— 在有人真的填滿它之前，同樣可疑。
+
+### 把真正的天花板夾出來
+
+ctxprobe 退兩步就停了。要找到 fill-validated 的天花板真正在哪，
+同一個擺法直接餵 95% 的 prompt，長度用伺服器自己的 `/tokenize` 量出來：
+
+| `-c` | ub | prompt token | GPU 0 | GPU 1 | Prefill | TTFT | |
+|---|---|---|---|---|---|---|---|
+| **61,440** | 512 | **57,819** | **32,055** | 30,171 | **621** | **93 s** | **PASS** |
+| 69,632 | 512 | 66,041 | 32,107 | 30,215 | — | — | graph 重新保留，device 0 要 1,203 MiB |
+| 77,824 | 512 | 72,439 | 32,105 | 29,965 | — | — | top-k argsort |
+| 91,648 | 256 | 86,791 | 32,107 | 29,869 | — | — | top-k argsort |
+| 91,648 | 128 | 86,791 | 32,107 | 29,891 | — | — | top-k argsort |
+
+**61,440 在 95% 填充下撐住了，GPU 0 剩 54 MiB。69,632 沒有。**
+這個擺法的確認天花板在兩者之間，從餘裕和每 token 的成長看，大概在下界往上 2K 以內。
+這一頁要記的數字是：**兩張卡、f16 KV，約 61K** —— 對照階梯宣稱的 91,648。
+
+69,632 死得跟其他幾個不一樣 —— 不在 pool 裡，而在 graph allocator：
+prefill 進行到一半、n_kv 長大時，它在 GPU 0 重新保留一塊 1,203 MiB 的 compute buffer。
+同一個原因，另一個配置器。
+
+填了 58K 之後的 prefill 是 621 tok/s，同一個擺法在 15.5K 是 927：
+視窗越滿，indexer 在每個 ubatch 裡佔的比例越大。
+
+**`-ub` 那個假設這輪沒有測到。** 91,648 那兩列本來是要驗證更小的 ubatch
+能不能把 indexer 的工作集縮到夠買回 context —— 兩個都死得跟 512 一模一樣。
+但在 91,648，光 GPU 0 上的 KV 就比 61,440 多約 370 MiB，餘裕只有 54；
+那個擺法在 sparse buffer 進場之前就先被 KV 卡死了，`-ub` 再小也顯示不出任何東西。
+該做的測試是 69,632 配 `-ub` 128。還開著。
+
 ## Engram 放 SSD
 
 問題是：expert 在 `-ncmoe 28`（CPU 端 32.3 GiB）之下，
@@ -483,10 +591,19 @@ Prefill 到第十三個還在爬。一部分是 50 個字的詞表：只有 2,50
 6. **50 個字的清單跑 13 個請求，是一條 warm-up 曲線。** 2,500 種 bigram 逐漸收斂進快取，
    prefill 一直漲到實驗結束 —— 那個 −23% 只是實驗剛好停在哪裡。
    真實文章、30 個請求、後 20 個平均：−34%，而且是平的。
+7. **「四個字元一個 token」不是 tokenizer。** 用字元數估 95% 的 prompt，
+   在循環過的文字上超了 6–9%；五次跑都在任何 prefill 開始之前就拿到 HTTP 400
+   `exceeds the available context size`，而腳本把五次全部歸成 PREFILL_OOM。
+   ctxprobe 用伺服器的 `/tokenize` 逼近就是為了這個；繞過它的捷徑本身就是 bug。
+8. **`curl` 回來之後再 `pgrep` 是個競態，而 `-o` 在連線斷掉時不會清空檔案。**
+   在 prefill 中途死掉的伺服器先關 socket、後退出；卡在那個縫隙裡檢查它是「活的」，
+   而輸出檔裡還是上一輪的 JSON。四次 crash 被歸成「REJECTED」，還附著一個過期但看起來
+   合理的 body。伺服器 log 裡的 backtrace 是唯一搶不贏的證人。
 
 ## 尚未量測
 
-- 用 ctxprobe 量 context 天花板，在兩張卡上、留有餘裕的擺法下。
-- `-ncmoe 4 --tensor-split 26,22 -ub 2048`：prefill 掃描指向的那個組合，
-  以及它能不能超過 1,527。
+- 把 fill-validated 的天花板二分到 ctxprobe 的 256 步進，在 61,440 和 69,632 之間；
+  以及 q8_0 KV 之下的同一個數字。
+- 69,632 配 `-ub` 128：在稀疏注意力模型上，更小的 ubatch 能不能拿 prefill 換 context。
+- DeepSeek-V4-Flash 的 131,072 在 95% 填充下。它從沒被驗證過，而它有同一類的 indexer。
 - `UD-Q3_K_XL` 在 `-ncmoe 0`：88 tok/s 的地板，以及約 1,700 tok/s 的 prefill 外推。

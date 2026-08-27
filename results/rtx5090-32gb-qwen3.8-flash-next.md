@@ -13,8 +13,10 @@ per token**, and what happens when you try to take it off the RAM budget.
 > built here at `213df58`. One later experiment adds a one-line env-gated patch to
 > `llama-mmap.cpp`, off by default, shown where it is used.
 >
-> **Not measured yet:** the context ceiling. Speed figures are at the default
-> `n_ubatch` 512 and f16 KV unless the section says otherwise.
+> Speed figures are at the default `n_ubatch` 512 and f16 KV unless the
+> section says otherwise. The two-card context ceiling is bracketed, not
+> bisected — and that section is as much about what the ladder missed as
+> about the number.
 
 ## Hardware
 
@@ -349,6 +351,128 @@ Extrapolating the per-layer cost to `-ncmoe 0` gives ~1,700 tok/s at `-ub` 512
 — what `UD-Q3_K_XL` would be expected to reach with everything on two cards.
 Extrapolation, not measurement.
 
+### The split that unlocks `-ub` 2048
+
+`-ncmoe 4 --tensor-split 26,22`, the combination the sweep pointed at:
+
+| ub | GPU 0 | GPU 1 | Prefill | TTFT | Generate | |
+|---|---|---|---|---|---|---|
+| **2048** | 31,963 | 29,981 | **1,548** | **10.0 s** | 59.3 | PASS |
+| 4096 | 32,099 | 29,975 | — | — | — | PREFILL_OOM on device 0 |
+
+It works as predicted — GPU 1 now has the room and 2048 loads — and it is the
+best prefill figure on this page, by 1.4%, at a cost of 7 tok/s of decode
+against `-ncmoe 2` / `-ub` 1024. Not worth it; 1,527 / 66 stands. `-ub` 4096
+dies on GPU 0, which the split has made the full card, in the allocation the
+next section is about.
+
+## Context ceiling on two cards
+
+ctxprobe at `-ncmoe 4 --tensor-split 26,22`, f16 KV, `--reasoning-budget 0`,
+`--max 131072`. Its `PEAK_VRAM` column reads only the first device in
+`CUDA_VISIBLE_DEVICES`, so it is GPU 0 here.
+
+| Context | Result | GPU 0 | Prefill | Generate | Filled |
+|---|---|---|---|---|---|
+| 8,192 | PASS | 30,687 | 1,732 | 59.2 | 4,024 |
+| 131,072 | LOAD_FAIL | — | — | — | — |
+| 69,632 | PASS | 31,721 | 1,785 | 59.2 | 4,024 |
+| 100,352 | LOAD_FAIL | — | — | — | — |
+| 84,992 | PASS | 31,985 | 1,821 | 59.6 | 4,024 |
+| 92,672 | PREFILL_OOM | 32,103 | — | — | died@4024 |
+| 88,832 | PASS | 32,053 | 1,823 | 58.0 | 4,024 |
+| 90,624 | PASS | 32,083 | 1,810 | 58.7 | 4,024 |
+| 91,648 | PASS | 32,099 | 1,812 | 59.2 | 4,024 |
+| 92,160 | PASS | 32,107 | 1,819 | 58.8 | 4,024 |
+| 92,416 | PREFILL_OOM | 32,105 | — | — | died@4024 |
+
+Then the part that matters:
+
+```
+Validating 92160 at 95% fill...
+  92160 failed at 95% fill (PREFILL_OOM)      died@87063
+  91904 failed at 95% fill (PREFILL_OOM)      died@86816
+  91648 failed at 95% fill (PREFILL_OOM)      died@86592
+  still failing at 95% fill after backing off.
+  The ladder stops at 4096 tokens, so this is a size only a near-full
+  prompt breaks — no such case has been measured before.
+
+Largest context that cleared the ladder: 91648 tokens (UNCONFIRMED)
+```
+
+**Every PASS in that table above ~63K is false**, and the 95% validation is
+the only thing that said so. The tool has carried that branch since the ladder
+was written and never reached it. This is the first time.
+
+### What broke, and why the ladder could not see it
+
+The failures share a backtrace, and it is not the one every earlier failure on
+this project had:
+
+```
+ggml_cuda_op_top_k
+  -> argsort_f32_i32_cuda_cub
+    -> ggml_cuda_pool_vmm::alloc          CUDA error: out of memory
+```
+
+That is the **QSA indexer's top-k selection**. It scores every cached block
+(`compress_ratio` 4 tokens each) for every query row of the ubatch, sorts, and
+keeps `indexer.top_k` 2048. The score tensor, its graph buffer and the sort's
+scratch all scale with **n_kv × n_ubatch** — with how much context is already
+in the cache. Below `top_k + compress_ratio − 1` = 2,051 tokens the selection
+is total and QSA is dense by construction; above it the working set grows with
+every token in the window.
+
+The ladder's rungs are 64, 512 and 4096. The 4,096-token prompt does reach the
+sparse path — but sizes it for n_kv ≈ 4K. An 87K prompt needs twenty times
+that, and on a card with 10 MiB to spare it dies about 5,000 tokens in, 2.9 s
+after the 4096 rung passed.
+
+This is the first buffer measured on this project that **grows with prompt
+length**. [gotcha #4](../docs/gotchas.md) says they don't — that the ladder
+works because buffers follow batch shape, not context — and for dense
+attention it is right. Sparse attention with a learned indexer is the
+exception. Two consequences for the tool: on this architecture the 4096 rung
+is not a proxy for a full window, so the search should bisect the
+fill-validated ceiling rather than stop after two back-offs; and
+[DeepSeek-V4-Flash's 131,072](rtx5090-32gb-deepseek-v4-flash.md) — DSA,
+ladder-verified, never fill-validated — is under the same suspicion until
+someone fills it.
+
+### Bracketing the real ceiling
+
+ctxprobe backs off two steps and stops. To find where the fill-validated
+ceiling actually is, the same placement was given a 95% prompt directly,
+sized against the server's own `/tokenize`:
+
+| `-c` | ub | Prompt tokens | GPU 0 | GPU 1 | Prefill | TTFT | |
+|---|---|---|---|---|---|---|---|
+| **61,440** | 512 | **57,819** | **32,055** | 30,171 | **621** | **93 s** | **PASS** |
+| 69,632 | 512 | 66,041 | 32,107 | 30,215 | — | — | graph reserve, 1,203 MiB on device 0 |
+| 77,824 | 512 | 72,439 | 32,105 | 29,965 | — | — | top-k argsort |
+| 91,648 | 256 | 86,791 | 32,107 | 29,869 | — | — | top-k argsort |
+| 91,648 | 128 | 86,791 | 32,107 | 29,891 | — | — | top-k argsort |
+
+**61,440 holds at 95% fill with 54 MiB to spare on GPU 0. 69,632 does not.**
+The confirmed ceiling at this placement is between them, and from the slack
+and the per-token growth probably within 2K of the lower bound. That is the
+number for this page: **~61K on two cards at f16 KV**, against the 91,648 the
+ladder claimed.
+
+69,632 fails differently from the rest — not in the pool but in the graph
+allocator, re-reserving a 1,203 MiB compute buffer on GPU 0 partway through
+the prefill as n_kv grows. Same cause, other allocator.
+
+Prefill at 58K filled is 621 tok/s against 927 at 15.5K on the same
+placement: the indexer is a growing share of every ubatch as the window fills.
+
+**The `-ub` hypothesis was not tested by this.** The 91,648 rows were meant
+to check whether a smaller ubatch shrinks the indexer's working set enough to
+buy context — and both died the same way as 512. But at 91,648 the KV cache
+alone on GPU 0 is ~370 MiB more than at 61,440, against 54 MiB of slack; the
+placement is KV-bound there before the sparse buffers enter, and no `-ub`
+could have shown anything. The test that would is 69,632 at `-ub` 128. Open.
+
 ## Engram on SSD
 
 The question: with experts at `-ncmoe 28` (32.3 GiB of them on the CPU side),
@@ -527,11 +651,25 @@ Each of these produced a clean-looking table with no signal in it.
    bigrams converge into cache and the prefill number keeps rising until the run
    ends — the −23% was wherever the run happened to stop. Real prose, thirty
    requests, mean over the back twenty: −34%, and flat.
+7. **Four characters per token is not a tokenizer.** Sizing the 95% prompt by
+   character count overshot by 6–9% on cycled text; five runs returned HTTP
+   400 `exceeds the available context size` before a single prefill, and the
+   script filed all five as PREFILL_OOM. ctxprobe converges on the server's
+   `/tokenize` for this reason; the shortcut around it was the bug.
+8. **`pgrep` after `curl` returns is a race, and `-o` does not truncate on a
+   dead connection.** A server dying mid-prefill closes the socket first and
+   exits after; checked in that gap it is "alive", and the output file still
+   holds the previous run's JSON. Four crashes were filed as "REJECTED" with a
+   stale, valid-looking body attached. The backtrace in the server log is the
+   one witness that cannot be raced.
 
 ## Still to measure
 
-- Context ceiling via ctxprobe, on two cards at a placement that leaves room.
-- `-ncmoe 4 --tensor-split 26,22 -ub 2048`: the combination the prefill sweep
-  points at, and whether it clears 1,527.
+- The fill-validated ceiling to ctxprobe's 256-token step, between 61,440 and
+  69,632; and the same at q8_0 KV.
+- `-ub` 128 at 69,632: whether a smaller ubatch trades prefill for context on
+  a sparse-attention model.
+- DeepSeek-V4-Flash's 131,072 at 95% fill. It was never validated, and it has
+  the same kind of indexer.
 - `UD-Q3_K_XL` at `-ncmoe 0`: the 88 tok/s floor, and the ~1,700 tok/s prefill
   extrapolation.

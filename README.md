@@ -244,7 +244,7 @@ Without torch everything still works, you just don't get that line.
 |---|---|---|---|---|---|---|
 | RTX 5090 32GB | DeepSeek-V4-Flash | UD-IQ4_XS | q8_0 | 131,072 ‡ | 775 tok/s | 13.3 tok/s |
 | RTX 5090 32GB | Qwen3.8-Flash-Next | UD-IQ4_XS | f16 | — ¶ | 1040 tok/s | 35.5 tok/s |
-| 2× RTX 5090 32GB | Qwen3.8-Flash-Next | UD-IQ4_XS | f16 | — ¶ | 1527 tok/s | 83 tok/s |
+| 2× RTX 5090 32GB | Qwen3.8-Flash-Next | UD-IQ4_XS | f16 | 61,440 ¶ | 1527 tok/s | 83 tok/s |
 | RTX 5060 Ti 16GB | Gemma4-26B-A4B | QAT q4_0 | q8_0 | **105,984** | 1890 tok/s | 50.8 tok/s |
 | RTX 5060 Ti 16GB | Qwen3.6-27B | IQ4_XS | q8_0 | 34,816 | 858 tok/s | 24.6 tok/s |
 | RTX 5060 Ti 16GB | Qwen3.6-27B | IQ4_XS | f16 | 20,224 | 923 tok/s | 26.9 tok/s |
@@ -263,12 +263,13 @@ search cap, and it is ladder-verified but not fill-validated. Prefill quoted at
 RAM and only 12.3 GB of VRAM** — the card is the cheap half. Generate is 13.3 on
 all 32 threads, 12.07 with 2 held back for other services.
 
-¶ 176.9 B parameters, 87 GiB, on unmerged llama.cpp (PR #27742); context
-ceiling not yet measured. On one card prefill and generate come from expert
-placements that do not coexist: generate at `-ncmoe 28` / `-ub 512`, prefill
-at `-ncmoe 36` / `-ub 8192`. Two cards: `-ncmoe 2`, generate at 8K, prefill at
-`-ub 1024`. The page is about where the 26.8 GiB n-gram table — 29% of the
-model — can live, and what a second card buys:
+¶ 176.9 B parameters, 87 GiB, on unmerged llama.cpp (PR #27742). On one card
+prefill and generate come from expert placements that do not coexist:
+generate at `-ncmoe 28` / `-ub 512`, prefill at `-ncmoe 36` / `-ub 8192`; the
+single-card ceiling was not measured. Two cards: `-ncmoe 2`, generate at 8K,
+prefill at `-ub 1024`; the ceiling is at `-ncmoe 4 --tensor-split 26,22`,
+fill-validated at 61,440 and bracketed rather than bisected — the ladder had
+said 91,648, and that page is partly about why it was wrong:
 [rtx5090-32gb-qwen3.8-flash-next.md](results/rtx5090-32gb-qwen3.8-flash-next.md).
 
 § **The quant name does not fix the bits.** `UD-IQ4_XS` is 4.1703 bits per
