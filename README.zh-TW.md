@@ -241,6 +241,7 @@ ctxprobe MODEL.gguf [選項] [-- 額外的 llama-server 參數]
 | GPU | 模型 | 量化 | KV | 最大 context | Prefill | 生成 |
 |---|---|---|---|---|---|---|
 | RTX 5090 32GB | DeepSeek-V4-Flash | UD-IQ4_XS | q8_0 | 131,072 ‡ | 775 tok/s | 13.3 tok/s |
+| RTX 5090 32GB | Qwen3.8-Flash-Next | UD-IQ4_XS | f16 | — ¶ | 282 tok/s | 35.5 tok/s |
 | RTX 5060 Ti 16GB | Gemma4-26B-A4B | QAT q4_0 | q8_0 | **105,984** | 1890 tok/s | 50.8 tok/s |
 | RTX 5060 Ti 16GB | Qwen3.6-27B | IQ4_XS | q8_0 | 34,816 | 858 tok/s | 24.6 tok/s |
 | RTX 5060 Ti 16GB | Qwen3.6-27B | IQ4_XS | f16 | 20,224 | 923 tok/s | 26.9 tok/s |
@@ -258,6 +259,12 @@ ctxprobe MODEL.gguf [選項] [-- 額外的 llama-server 參數]
 Prefill 是 `-ub 8192` 的數字；預設的 512 只有 151 tok/s。
 **這一行需要 192 GB 系統記憶體，卻只需要 12.3 GB 顯存** —— 顯卡是便宜的那一半。
 生成 13.3 是用滿 32 執行緒；留 2 個核心給其他服務時是 12.07。
+
+¶ 176.9 B 參數、87 GiB，跑在尚未合併的 llama.cpp（PR #27742）上。
+expert 拆成 28 層 CPU / 20 層 GPU（`-ncmoe 28`，30.4 GB 顯存）；
+prefill 是預設 `-ub 512`、尚未掃描；context 天花板尚未量測。
+那一頁講的是那張 26.8 GiB 的 n-gram 表 —— 模型的 29% —— 能放在哪裡：
+[rtx5090-32gb-qwen3.8-flash-next.zh-TW.md](results/rtx5090-32gb-qwen3.8-flash-next.zh-TW.md)。
 
 § **量化的名字決定不了 bits。** `UD-IQ4_XS` 是每權重 4.1703 bits，
 Qwen3.6 的 `IQ4_XS` 是 4.5892 —— 同一個名字家族，差 0.42 bpw，

@@ -243,6 +243,7 @@ Without torch everything still works, you just don't get that line.
 | GPU | Model | Quant | KV | Max context | Prefill | Generate |
 |---|---|---|---|---|---|---|
 | RTX 5090 32GB | DeepSeek-V4-Flash | UD-IQ4_XS | q8_0 | 131,072 ‡ | 775 tok/s | 13.3 tok/s |
+| RTX 5090 32GB | Qwen3.8-Flash-Next | UD-IQ4_XS | f16 | — ¶ | 282 tok/s | 35.5 tok/s |
 | RTX 5060 Ti 16GB | Gemma4-26B-A4B | QAT q4_0 | q8_0 | **105,984** | 1890 tok/s | 50.8 tok/s |
 | RTX 5060 Ti 16GB | Qwen3.6-27B | IQ4_XS | q8_0 | 34,816 | 858 tok/s | 24.6 tok/s |
 | RTX 5060 Ti 16GB | Qwen3.6-27B | IQ4_XS | f16 | 20,224 | 923 tok/s | 26.9 tok/s |
@@ -260,6 +261,12 @@ search cap, and it is ladder-verified but not fill-validated. Prefill quoted at
 `-ub 8192`; the default 512 gives 151 tok/s. **This row needs 192 GB of system
 RAM and only 12.3 GB of VRAM** — the card is the cheap half. Generate is 13.3 on
 all 32 threads, 12.07 with 2 held back for other services.
+
+¶ 176.9 B parameters, 87 GiB, on unmerged llama.cpp (PR #27742). Experts split
+28 layers CPU / 20 GPU (`-ncmoe 28`, 30.4 GB VRAM); prefill at the default
+`-ub 512`, no sweep yet; context ceiling not yet measured. The page is about
+where the 26.8 GiB n-gram table — 29% of the model — can live:
+[rtx5090-32gb-qwen3.8-flash-next.md](results/rtx5090-32gb-qwen3.8-flash-next.md).
 
 § **The quant name does not fix the bits.** `UD-IQ4_XS` is 4.1703 bits per
 weight against Qwen3.6's `IQ4_XS` at 4.5892 — same label family, 0.42 bpw apart,
