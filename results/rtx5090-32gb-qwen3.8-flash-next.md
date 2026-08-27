@@ -13,8 +13,8 @@ per token**, and what happens when you try to take it off the RAM budget.
 > built here at `213df58`. One later experiment adds a one-line env-gated patch to
 > `llama-mmap.cpp`, off by default, shown where it is used.
 >
-> **Not measured yet:** the `-ub` prefill sweep and the context ceiling. Every
-> speed figure below is at the default `n_ubatch` 512 and f16 KV.
+> **Not measured yet:** the context ceiling. Speed figures are at the default
+> `n_ubatch` 512 and f16 KV unless the section says otherwise.
 
 ## Hardware
 
@@ -160,6 +160,194 @@ At `-ncmoe 48`, sampled during generation:
 
 **A 176.9 B model runs on 6.5 GB of VRAM with the card 80% idle.** Moving expert
 layers onto it converts idle silicon into 42% more throughput.
+
+## Prefill: `-ub`, and where the VRAM has to come from
+
+Same mechanism as [DeepSeek-V4-Flash](rtx5090-32gb-deepseek-v4-flash.md): a
+512-token ubatch under 512-choose-10 routing touches nearly every expert in a
+layer, so each ubatch reads the whole layer off DDR5 and that cost is amortised
+over however many tokens are in the batch. Raising `-ub` is the lever. But the
+compute buffer is sized by `-ub` at load, and on this card the VRAM is already
+spoken for.
+
+15,505-token real-prose prompt, `-c 24576`, `-b` = `-ub`, `--threads 16`:
+
+**At `-ncmoe 28` — the best decode placement — nothing above 512 fits.**
+
+| ub | Peak VRAM | Prefill | TTFT | Generate | |
+|---|---|---|---|---|---|
+| 512 | 31,963 | 254 | 61.0 s | 31.79 | PASS |
+| 1024 | 32,101 | — | — | — | PREFILL_OOM |
+| 2048 | 32,103 | — | — | — | PREFILL_OOM |
+| 4096 | — | — | — | — | LOAD_OOM |
+| 8192 | — | — | — | — | LOAD_OOM |
+
+Sixty-one seconds to the first token of a 15K prompt, and 146 MiB of headroom
+to do anything about it.
+
+**At `-ncmoe 36` — eight layers back on the CPU — the curve appears.**
+
+| ub | Peak VRAM | Prefill | TTFT | Generate | vs 512 |
+|---|---|---|---|---|---|
+| 512 | 22,471 | 202 | 76.6 s | 27.75 | — |
+| 1024 | 22,755 | 323 | 47.9 | 27.68 | 1.6× |
+| 2048 | 23,025 | 520 | 29.8 | 27.49 | 2.6× |
+| 4096 | 23,567 | 790 | 19.6 | 27.77 | 3.9× |
+| **8192** | **25,453** | **1,040** | **14.9** | 27.66 | **5.1×** |
+
+**5.1× — the same multiplier DeepSeek gave**, for 2,982 MiB of compute buffer
+(DeepSeek's was 3.5 GB). Generation is flat at 27.5–27.8 the whole way, which
+is the control that makes the prefill column unambiguous.
+
+The trade on one card, then:
+
+| | `-ncmoe 28`, ub 512 | `-ncmoe 36`, ub 8192 |
+|---|---|---|
+| Generate | **31.8** | 27.7 (−13%) |
+| Prefill | 254 | **1,040 (4.1×)** |
+| TTFT, 15.5K prompt | 61 s | 15 s |
+
+Eight expert layers moved off the card buy 3 GB, and 3 GB buys four times the
+prefill for 13% of the decode. Which side of that you want depends entirely on
+prompt length; for anything with a system prompt and history it is the right
+side.
+
+## Two cards
+
+The engram stays in RAM whatever happens (it never left it in any run above).
+Everything else is 87.24 − 26.82 = **60.42 GiB**, and two 5090s are nominally
+64 GB. So does it fit?
+
+With the vLLM instance taken down for the duration, `CUDA_VISIBLE_DEVICES=0,1`,
+`-c 8192`, `--threads 16`:
+
+| Config | GPU 0 | GPU 1 | Generate | ms/token | |
+|---|---|---|---|---|---|
+| `-ncmoe 0`, default split | — | — | — | — | **load fails, 66 MiB short on GPU 0** |
+| `-ncmoe 2`, default split | 30,621 | 30,721 | 82.77 | 12.08 | PASS |
+| `-ncmoe 2`, `--tensor-split 25,23` | 31,845 | 29,495 | 83.72 | 11.94 | PASS |
+| `-ncmoe 4`, `--tensor-split 26,22` | 30,633 | 28,273 | 73.02 | 13.69 | PASS |
+| `-ncmoe 0`, `--tensor-split 25,23` | — | — | — | — | load fails |
+
+**Not quite — but two layers on the CPU gets 83 tok/s, 2.36× the single card.**
+And the law from the single-card sweep held across the PCIe boundary without
+adjustment: `-ncmoe 4` was predicted at 13.69 ms and measured at 13.69;
+`-ncmoe 2` predicted 12.5 and came in at 11.94–12.08. The last two layers are
+4% of the expert bytes and worth about 1.2 ms a token — going from 83 to the
+88 tok/s floor is a 6% gain, not the leap "all on GPU" suggests.
+
+### Why 60 GiB does not fit in 64 GB
+
+Three things the nominal figure leaves out, all measured:
+
+1. **Driver reserve.** Each card reports 32,607 MiB and allocates 32,109
+   (498 MiB reserved, from the DeepSeek page). Two cards: 64,218 MiB, 62.7 GiB.
+2. **Per-card overhead.** CUDA context, compute buffer and KV are paid on
+   *each* card. Single-card, `-ncmoe 48` used 6,487 MiB of which 5,100 was
+   weights — 1,387 MiB of overhead at `-c 8192`. Two cards: ~2,400.
+3. **Layer granularity.** The split can only move in whole layers, 1,274 MiB
+   each, so one card always carries the rounding.
+
+```
+allocatable      64,218
+weights          61,870   (60.42 GiB)
+per-card overhead ~2,400
+                 ───────
+                   ~ −50 MiB
+```
+
+It is not a total; it is GPU 0, alone, 66 MiB over — that being the size of
+the allocation that failed, so the true gap is *at least* 66.
+
+**q8_0 KV does not close it.** Twelve full-attention layers with two KV heads
+is 24 KiB a token at f16 and ~14.8 at q8_0 (with its per-layer scratch —
+see [kv-cache-quant.md](../docs/kv-cache-quant.md)). At `-c 8192` that saves
+74 MiB across both cards, 37 on the one that is short. Untested, but the
+arithmetic is not close.
+
+**A smaller quant does.** From the GGUF headers of the other two builds in the
+repo, fetched without downloading them:
+
+| | File | Expert bpw | Non-engram | Per card at `-ncmoe 0` | Margin |
+|---|---|---|---|---|---|
+| `UD-IQ4_XS` (this run) | 87.2 GiB | 3.942 | 60.42 GiB | 32,135 | **over** |
+| **`UD-Q3_K_XL`** | 83.8 | 3.697 | **56.97** | 30,369 | **1.7 GB** |
+| `UD-IQ3_XXS` | 76.3 | 3.220 | 49.50 | 26,544 | 5.5 GB |
+
+The engram is `IQ4_NL` at 26.82 GiB in every one of them — unsloth pins it —
+so all of the reduction lands on the experts, which is exactly the part that has
+to fit. `UD-Q3_K_XL` gets `-ncmoe 0` onto two cards with 1.7 GB to spare;
+`UD-IQ3_XXS` leaves enough for real context or a large `-ub`, at 3.22 bpw on the
+experts, which [model-quant.md](../docs/model-quant.md) files under "only when
+nothing else fits". There is no `IQ4_XXS`; ggml's IQ4 family is `_XS` and `_NL`.
+
+### The default split, and where `-ncmoe` takes its relief from
+
+The prediction going in — from [gotcha #8](../docs/gotchas.md) — was that
+`-ncmoe 2` with the default split would land 24 expert layers on GPU 1 against
+22 on GPU 0 and OOM the heavier card. It did not: **at `-ncmoe 2` the default
+split came out balanced to within 100 MiB** (30,621 / 30,721), and the explicit
+`25,23` unbalanced it by 2,350.
+
+But that balance is not a general property. In the prefill sweep below, GPU 1
+sits at exactly the same figure at `-ncmoe 4` as at `-ncmoe 2` — 31,295,
+31,763, 32,015 at each `-ub` — while GPU 0 drops by 2,560. **The boundary does
+not move with `-ncmoe`, and every layer `-ncmoe` takes off the GPU comes off
+GPU 0.** At `-ncmoe 4` the default therefore leaves GPU 0 with 2.6 GB spare and
+GPU 1 full — the shape gotcha #8 describes — and it is why `-ub 2048` dies on
+device 1 at both settings. Whether `-ncmoe 2`'s balance was the splitter's
+doing or a coincidence of that one boundary is not resolved here.
+
+The practical rule: pair `-ncmoe N` with a `--tensor-split` that moves layers
+*onto* GPU 0. `-ncmoe 4 --tensor-split 26,22` measured 30,633 / 28,273 above,
+which would leave GPU 1 the ~1 GB that `-ub 2048` asks for. Untested in that
+combination.
+
+### Two cards: prefill
+
+This is where the second card pays. Same 15,505-token prompt, `-c 24576`,
+default split:
+
+| `-ncmoe` | ub | GPU 0 | GPU 1 | Prefill | TTFT | Generate | |
+|---|---|---|---|---|---|---|---|
+| 2 | 512 | 31,199 | 31,295 | **1,199** | **12.9 s** | 67.3 | PASS |
+| 2 | 1024 | 31,657 | 31,763 | **1,527** | **10.2 s** | 66.1 | PASS |
+| 2 | 2048 | 32,085 | 32,015 | — | — | — | PREFILL_OOM, 1,006 MiB on device 1 |
+| 2 | 4096 | — | — | — | — | — | LOAD_OOM |
+| 4 | 512 | 28,639 | 31,295 | 927 | 16.7 s | 59.6 | PASS |
+| 4 | 1024 | 28,975 | 31,763 | 1,249 | 12.4 s | 59.9 | PASS |
+| 4 | 2048 | 29,317 | 32,015 | — | — | — | PREFILL_OOM, 1,006 MiB on device 1 |
+| 4 | 4096 | — | — | — | — | — | LOAD_OOM |
+
+**At the default `-ub` 512, two cards prefill at 1,199 tok/s against one card's
+254 — 4.7×, and the 15K prompt's first token arrives in 13 s instead of 61.**
+That is before touching the `-ub` lever: with the experts in VRAM the DDR5
+amortisation problem mostly disappears, and batch size stops mattering as much.
+`-ub` 1024 adds 27%; 2048 does not fit, for the GPU 1 reason above.
+
+Against the single card's best prefill configuration:
+
+| | 1× 5090, `-ncmoe 36`, ub 8192 | 2× 5090, `-ncmoe 2`, ub 1024 |
+|---|---|---|
+| Prefill | 1,040 | **1,527** |
+| TTFT, 15.5K | 14.9 s | **10.2 s** |
+| Generate (15.5K filled) | 27.7 | **66.1** |
+
+The two-card box wins both axes at once, which one card cannot — there,
+prefill and decode compete for the same 3 GB.
+
+Two more things the table says. Each CPU expert layer costs prefill about
+0.12 ms per token at `-ub` 512 (`-ncmoe 2` → `4` is 1,199 → 927), the same
+per-layer figure the single-card sweeps gave (254 → 202 for eight layers) —
+a property of the DDR5 read, not of the card count. And generation here is 67
+rather than the 83 measured at `-c 8192` with a short prompt: 15.5K tokens of
+KV in the window cost ~20%, more than the ~10% the single card lost, because
+the GPU-side floor that grows with context is a larger share of a 12 ms token
+than of a 28 ms one.
+
+Extrapolating the per-layer cost to `-ncmoe 0` gives ~1,700 tok/s at `-ub` 512
+— what `UD-Q3_K_XL` would be expected to reach with everything on two cards.
+Extrapolation, not measurement.
 
 ## Engram on SSD
 
@@ -342,5 +530,8 @@ Each of these produced a clean-looking table with no signal in it.
 
 ## Still to measure
 
-- `-ub` sweep for prefill, at `-ncmoe 28`.
-- Context ceiling via ctxprobe, same configuration.
+- Context ceiling via ctxprobe, on two cards at a placement that leaves room.
+- `-ncmoe 4 --tensor-split 26,22 -ub 2048`: the combination the prefill sweep
+  points at, and whether it clears 1,527.
+- `UD-Q3_K_XL` at `-ncmoe 0`: the 88 tok/s floor, and the ~1,700 tok/s prefill
+  extrapolation.
