@@ -14,9 +14,9 @@ per token**, and what happens when you try to take it off the RAM budget.
 > `llama-mmap.cpp`, off by default, shown where it is used.
 >
 > Speed figures are at the default `n_ubatch` 512 and f16 KV unless the
-> section says otherwise. The two-card context ceiling is bracketed, not
-> bisected — and that section is as much about what the ladder missed as
-> about the number.
+> section says otherwise. The context-ceiling section is as much about what
+> the ladder missed as about the numbers — and about the change to ctxprobe
+> that came out of it.
 
 ## Hardware
 
@@ -366,7 +366,9 @@ against `-ncmoe 2` / `-ub` 1024. Not worth it; 1,527 / 66 stands. `-ub` 4096
 dies on GPU 0, which the split has made the full card, in the allocation the
 next section is about.
 
-## Context ceiling on two cards
+## Context ceiling
+
+### Two cards, as the ladder saw it
 
 ctxprobe at `-ncmoe 4 --tensor-split 26,22`, f16 KV, `--reasoning-budget 0`,
 `--max 131072`. Its `PEAK_VRAM` column reads only the first device in
@@ -472,6 +474,40 @@ buy context — and both died the same way as 512. But at 91,648 the KV cache
 alone on GPU 0 is ~370 MiB more than at 61,440, against 54 MiB of slack; the
 placement is KV-bound there before the sparse buffers enter, and no `-ub`
 could have shown anything. The test that would is 69,632 at `-ub` 128. Open.
+
+### One card, with the tool fixed
+
+ctxprobe now does what the previous subsection did by hand: when the winner
+fails at 95% fill it bisects below it, validating every probe at full length,
+and reports the size that held next to what the ladder had claimed. The first
+run of that code path, on the one card that was free — `-ncmoe 30`,
+`-ub 2048`, f16, `--min 32768 --max 81920`:
+
+```
+32768      PASS        30253       1101.01    29.62      4024
+81920      PASS        32029       1113.98    30.18      4024
+
+Validating 81920 at 95% fill...
+  81920 failed at 95% fill (PREFILL_OOM)
+  Bisecting for the size that holds a full window:
+  57088 failed   44800 holds   50944 failed   47872 holds
+  49408 failed   48640 failed  48128 holds    48384 failed
+  confirmed: 48128 — the ladder had said 81920, 33792 tokens too high
+
+Largest context that actually runs: 48128 tokens
+  peak VRAM 32097 MiB | prefill 654.45 tok/s | generate 26.10 tok/s
+```
+
+**The ladder overstated the ceiling by 41%.** Eight fill-validated probes,
+each a full boot and a 40–55K-token prefill, converged to the 256-token step
+in about half an hour. That is what the honest number costs on this
+architecture, and it is bounded — log₂ of the range — where the old two-step
+back-off would have stopped at 81,408 UNCONFIRMED.
+
+So the single-card fill-validated ceiling is **48,128 at `-ncmoe 30` /
+`-ub 2048` / f16** (45,571 tokens filled, prefill 654 tok/s, decode 26.1).
+`-ub 2048` inflates the indexer's working set fourfold against 512, so at the
+default `-ub` this placement holds more; 48,128 is its floor.
 
 ## Engram on SSD
 
@@ -665,8 +701,8 @@ Each of these produced a clean-looking table with no signal in it.
 
 ## Still to measure
 
-- The fill-validated ceiling to ctxprobe's 256-token step, between 61,440 and
-  69,632; and the same at q8_0 KV.
+- The two-card ceiling to the 256-token step, between 61,440 and 69,632, with
+  the bisecting ctxprobe; and the same at q8_0 KV.
 - `-ub` 128 at 69,632: whether a smaller ubatch trades prefill for context on
   a sparse-attention model.
 - DeepSeek-V4-Flash's 131,072 at 95% fill. It was never validated, and it has

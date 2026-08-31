@@ -45,7 +45,10 @@ Largest context that actually runs: 34816 tokens
 Under two minutes. Note `died@64`: 35072 loaded, served an 18-token prompt at
 full speed, and died on a 64-token one — the row no load-time estimate can
 produce. The winner is then re-validated against a full-length prompt, which is
-where its speed figures come from.
+where its speed figures come from. If that validation fails — the ladder
+cleared a size a full window cannot hold, which sparse-attention models with
+an indexer do — the search bisects again below it, validating every probe at
+full length, and reports the size that actually held.
 
 ## Why this exists
 
@@ -243,7 +246,7 @@ Without torch everything still works, you just don't get that line.
 | GPU | Model | Quant | KV | Max context | Prefill | Generate |
 |---|---|---|---|---|---|---|
 | RTX 5090 32GB | DeepSeek-V4-Flash | UD-IQ4_XS | q8_0 | 131,072 ‡ | 775 tok/s | 13.3 tok/s |
-| RTX 5090 32GB | Qwen3.8-Flash-Next | UD-IQ4_XS | f16 | — ¶ | 1040 tok/s | 35.5 tok/s |
+| RTX 5090 32GB | Qwen3.8-Flash-Next | UD-IQ4_XS | f16 | 48,128 ¶ | 1040 tok/s | 35.5 tok/s |
 | 2× RTX 5090 32GB | Qwen3.8-Flash-Next | UD-IQ4_XS | f16 | 61,440 ¶ | 1527 tok/s | 83 tok/s |
 | RTX 5060 Ti 16GB | Gemma4-26B-A4B | QAT q4_0 | q8_0 | **105,984** | 1890 tok/s | 50.8 tok/s |
 | RTX 5060 Ti 16GB | Qwen3.6-27B | IQ4_XS | q8_0 | 34,816 | 858 tok/s | 24.6 tok/s |
@@ -266,10 +269,12 @@ all 32 threads, 12.07 with 2 held back for other services.
 ¶ 176.9 B parameters, 87 GiB, on unmerged llama.cpp (PR #27742). On one card
 prefill and generate come from expert placements that do not coexist:
 generate at `-ncmoe 28` / `-ub 512`, prefill at `-ncmoe 36` / `-ub 8192`; the
-single-card ceiling was not measured. Two cards: `-ncmoe 2`, generate at 8K,
-prefill at `-ub 1024`; the ceiling is at `-ncmoe 4 --tensor-split 26,22`,
-fill-validated at 61,440 and bracketed rather than bisected — the ladder had
-said 91,648, and that page is partly about why it was wrong:
+ceiling at `-ncmoe 30` / `-ub 2048`, found by the bisection ctxprobe now runs
+when a full window fails (the ladder had said 81,920). Two cards: `-ncmoe 2`,
+generate at 8K, prefill at `-ub 1024`; the ceiling at `-ncmoe 4
+--tensor-split 26,22`, fill-validated at 61,440 and bracketed by hand before
+that fix existed — the ladder had said 91,648. That page is partly about why
+the ladder was wrong:
 [rtx5090-32gb-qwen3.8-flash-next.md](results/rtx5090-32gb-qwen3.8-flash-next.md).
 
 § **The quant name does not fix the bits.** `UD-IQ4_XS` is 4.1703 bits per

@@ -8,6 +8,9 @@
 # needs device memory a nearly-full card hasn't got, so a config can load fine,
 # decode an 18-token prompt at full speed, and still CUDA-OOM on a 64-token one.
 # The winner is then re-validated once against a prompt that fills the window.
+# If that fails — a model whose buffers grow with the tokens already cached, as
+# sparse attention with an indexer does — the search runs again below it,
+# validating every probe at full length, and reports the size that held.
 #
 # Usage:
 #   ctxprobe MODEL.gguf [options] [-- extra llama-server args]
@@ -454,39 +457,65 @@ fi
 # rung, and this is also the independent second run of BEST — cost is +1 boot,
 # not xN, which is enough to catch an outside disturbance during the search.
 #
-# Backing off is capped at two steps. Walking down until something passes would
-# turn "+1 boot" into an unbounded search, and more than a step or two means the
-# ladder and the full-length prompt genuinely disagree about the ceiling — which
-# is a finding to report, not a number to keep hunting for.
-VALIDATED=0
+# If that fails, the ladder and a full window disagree about the ceiling, and
+# the ladder is the one that is wrong: something in this model grows with the
+# number of tokens already in the cache, which no 4096-token rung can size.
+# Measured once, on Qwen3.8-Flash-Next — the QSA indexer scores every cached
+# block for every ubatch row, so its top-k scratch scales with n_kv, and the
+# ladder passed every size up to 92K while a 95% prompt died at 5K tokens in.
+# So the fallback is a second binary search, this time validating every probe
+# at FILL%. It is bounded by log2(range/STEP) boots, and it ends on a size
+# that actually held a full window — or on the finding that nothing did.
+VALIDATED=0; LADDER_BEST=$BEST
 if (( BEST > 0 )); then
   (( JSON == 0 )) && { echo; echo "Validating $BEST at ${FILL}% fill..."; }
-  # Stepping down happens at the top of the next attempt, not after a failure,
-  # so BEST always names a size that was actually booted — never one that the
-  # loop skipped past on its way out.
-  for _try in 1 2 3; do
-    if (( _try > 1 )); then
-      (( BEST - STEP >= STEP )) || break
-      BEST=$(( BEST - STEP ))
-      (( JSON == 0 )) && echo "  backing off one step, retrying at $BEST"
-    fi
-    IFS=$'\t' read -r v p pre gen fl < <(try_ctx "$BEST" full)
-    record "$BEST" "final:$v" "$p" "$pre" "$gen" "$fl"
-    (( JSON == 1 )) && printf '  validate %s: %s\n' "$BEST" "$v" >&2
-    if [[ "$v" == PASS ]]; then
-      BEST_PEAK=$p; BEST_PRE=$pre; BEST_GEN=$gen; VALIDATED=1
-      (( JSON == 0 )) && echo "  confirmed: $BEST ($fl tokens filled)"
-      break
-    fi
-    (( JSON == 0 )) && echo "  $BEST failed at ${FILL}% fill ($v)"
-  done
-  if (( VALIDATED == 0 )); then
+  IFS=$'\t' read -r v p pre gen fl < <(try_ctx "$BEST" full)
+  record "$BEST" "final:$v" "$p" "$pre" "$gen" "$fl"
+  (( JSON == 1 )) && printf '  validate %s: %s\n' "$BEST" "$v" >&2
+  if [[ "$v" == PASS ]]; then
+    BEST_PEAK=$p; BEST_PRE=$pre; BEST_GEN=$gen; VALIDATED=1
+    (( JSON == 0 )) && echo "  confirmed: $BEST ($fl tokens filled)"
+  else
     (( JSON == 0 )) && {
-      echo "  still failing at ${FILL}% fill after backing off."
-      echo "  The ladder stops at 4096 tokens, so this is a size only a near-full"
-      echo "  prompt breaks — no such case has been measured before. Re-run with"
-      echo "  --keep --list \"$BEST\" and read the log; it is the interesting one."
+      echo "  $BEST failed at ${FILL}% fill ($v)"
+      echo "  The ladder cleared it and a full window did not, so a buffer in this"
+      echo "  model grows with the tokens already cached — sparse attention with an"
+      echo "  indexer does this. Bisecting for the size that holds a full window:"
     }
+    # hi is known to fail at fill. lo starts one step under the search floor,
+    # meaning "nothing known below"; it becomes a real floor only once a probe
+    # passes at fill. Every probe here is a full boot plus a FILL% prompt.
+    hi=$BEST; lo=$(( MIN - STEP )); LO_OK=0; _n=0
+    while (( hi - lo > STEP && _n < 12 )); do
+      mid=$(( (lo + hi) / 2 )); mid=$(( mid / STEP * STEP ))
+      (( mid <= lo )) && mid=$(( lo + STEP ))
+      (( mid >= hi )) && break
+      (( mid < STEP )) && break
+      _n=$(( _n + 1 ))
+      IFS=$'\t' read -r v p pre gen fl < <(try_ctx "$mid" full)
+      record "$mid" "final:$v" "$p" "$pre" "$gen" "$fl"
+      (( JSON == 1 )) && printf '  validate %s: %s\n' "$mid" "$v" >&2
+      if [[ "$v" == PASS ]]; then
+        lo=$mid; LO_OK=1; BEST_PEAK=$p; BEST_PRE=$pre; BEST_GEN=$gen
+        (( JSON == 0 )) && echo "  $mid holds at ${FILL}% fill ($fl tokens filled)"
+      else
+        hi=$mid
+        (( JSON == 0 )) && echo "  $mid failed at ${FILL}% fill ($v)"
+      fi
+    done
+    if (( LO_OK == 1 )); then
+      BEST=$lo; VALIDATED=1
+      (( JSON == 0 )) && {
+        echo "  confirmed: $BEST — the ladder had said $LADDER_BEST,"
+        echo "  $(( LADDER_BEST - BEST )) tokens too high"
+      }
+    else
+      (( JSON == 0 )) && {
+        echo "  nothing between $MIN and $LADDER_BEST survived a ${FILL}% prompt."
+        echo "  Re-run with --keep --list \"$LADDER_BEST\" and read the log; the"
+        echo "  backtrace names the op whose working set grows with the window."
+      }
+    fi
   fi
 fi
 
@@ -495,19 +524,22 @@ fi
 if (( JSON == 1 )); then
   python3 - "$MODEL" "$GPU_NAME" "$BEST" "$BEST_PEAK" "$BEST_PRE" "$BEST_GEN" \
            "$KV" "$PARALLEL" "$VRAM_TOTAL" "${VRAM_USABLE:-}" "$NGL" "$FILL" \
-           "$CUDA_LOADING" "$VRAM_BASE" "$FLASH_ATTN" "$VALIDATED" <<'PY'
+           "$CUDA_LOADING" "$VRAM_BASE" "$FLASH_ATTN" "$VALIDATED" "$LADDER_BEST" <<'PY'
 import json, os, sys
 (m, gpu, best, peak, pre, gen, kv, par, total, usable,
- ngl, fill, cuda_loading, free, flash_attn, validated) = sys.argv[1:17]
+ ngl, fill, cuda_loading, free, flash_attn, validated, ladder_best) = sys.argv[1:18]
 print(json.dumps({
     # Bump when the shape of this object changes, so collected results stay
     # interpretable once several machines have contributed.
-    "schema": 2,
+    "schema": 3,
     "model": os.path.basename(m), "gpu": gpu,
     "max_context": int(best),
     # False means the search ladder cleared this size but a prompt filling
     # fill_percent of the window did not. max_context is then unconfirmed.
     "validated_at_fill": validated == "1",
+    # What the 64/512/4096 ladder alone would have reported. Equal to
+    # max_context unless a full window failed and the search bisected down.
+    "ladder_max_context": int(ladder_best),
     "peak_vram_mib": int(peak) if peak else None,
     "prefill_tps": float(pre) if pre else None,
     "generate_tps": float(gen) if gen else None,
@@ -526,6 +558,8 @@ else
     SAFE=$(( BEST - 2 * STEP )); (( SAFE < STEP )) && SAFE=$BEST
     if (( VALIDATED == 1 )); then
       echo "Largest context that actually runs: $BEST tokens"
+      (( LADDER_BEST > BEST )) && \
+      echo "  the ladder cleared $LADDER_BEST; only a ${FILL}% prompt found the real edge"
     else
       echo "Largest context that cleared the ladder: $BEST tokens (UNCONFIRMED)"
       echo "  it did not survive a prompt filling ${FILL}% of the window"

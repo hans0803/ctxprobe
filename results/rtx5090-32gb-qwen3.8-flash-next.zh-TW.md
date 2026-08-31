@@ -13,8 +13,8 @@
 > 以環境變數控制的補丁，預設關閉，用到的地方會標出來。
 >
 > 除非該節另有說明，速度數字都是在預設的 `n_ubatch` 512 和 f16 KV 之下。
-> 兩張卡的 context 天花板是夾出來的區間、不是二分到底的 ——
-> 而那一節講的與其說是那個數字，不如說是階梯漏掉了什麼。
+> Context 天花板那一節講的與其說是那些數字，不如說是階梯漏掉了什麼 ——
+> 以及因此對 ctxprobe 做的修改。
 
 ## 硬體
 
@@ -333,7 +333,9 @@ expert 進了顯存之後，DDR5 攤提的問題大部分消失，batch 大小�
 高 1.4%，代價是比 `-ncmoe 2` / `-ub` 1024 少 7 tok/s 的 decode。不值得；1,527 / 66 還是那個配置。
 `-ub` 4096 死在 GPU 0 —— split 之後它成了滿的那張 —— 死在下一節要講的那個配置上。
 
-## 兩張卡的 context 天花板
+## Context 天花板
+
+### 兩張卡，階梯看到的樣子
 
 ctxprobe 在 `-ncmoe 4 --tensor-split 26,22`、f16 KV、`--reasoning-budget 0`、
 `--max 131072`。它的 `PEAK_VRAM` 欄只讀 `CUDA_VISIBLE_DEVICES` 的第一個裝置，所以這裡是 GPU 0。
@@ -426,6 +428,36 @@ prefill 進行到一半、n_kv 長大時，它在 GPU 0 重新保留一塊 1,203
 但在 91,648，光 GPU 0 上的 KV 就比 61,440 多約 370 MiB，餘裕只有 54；
 那個擺法在 sparse buffer 進場之前就先被 KV 卡死了，`-ub` 再小也顯示不出任何東西。
 該做的測試是 69,632 配 `-ub` 128。還開著。
+
+### 單卡，用修好的工具
+
+ctxprobe 現在會做上一小節用手做的事：勝出者在 95% 填充下失敗時，
+在它底下二分，每個探測點都用完整長度驗證，把撐得住的大小跟階梯宣稱的並排回報。
+這條程式路徑的第一次執行，在唯一空著的那張卡上 ——
+`-ncmoe 30`、`-ub 2048`、f16、`--min 32768 --max 81920`：
+
+```
+32768      PASS        30253       1101.01    29.62      4024
+81920      PASS        32029       1113.98    30.18      4024
+
+Validating 81920 at 95% fill...
+  81920 failed at 95% fill (PREFILL_OOM)
+  Bisecting for the size that holds a full window:
+  57088 failed   44800 holds   50944 failed   47872 holds
+  49408 failed   48640 failed  48128 holds    48384 failed
+  confirmed: 48128 — the ladder had said 81920, 33792 tokens too high
+
+Largest context that actually runs: 48128 tokens
+  peak VRAM 32097 MiB | prefill 654.45 tok/s | generate 26.10 tok/s
+```
+
+**階梯把天花板高估了 41%。** 八個填充驗證的探測點，每個都是一次完整啟動加 40–55K token 的 prefill，
+約半小時收斂到 256 的步進。那就是在這個架構上誠實數字的代價，而且它是有界的 ——
+範圍的 log₂ —— 舊的退兩步做法會停在 81,408 UNCONFIRMED。
+
+所以單卡的 fill-validated 天花板是 **48,128，在 `-ncmoe 30` / `-ub 2048` / f16 之下**
+（填了 45,571 個 token，prefill 654 tok/s，decode 26.1）。
+`-ub 2048` 讓 indexer 的工作集比 512 大四倍，所以預設 `-ub` 之下這個擺法撐得更多；48,128 是它的下界。
 
 ## Engram 放 SSD
 
@@ -602,7 +634,7 @@ Prefill 到第十三個還在爬。一部分是 50 個字的詞表：只有 2,50
 
 ## 尚未量測
 
-- 把 fill-validated 的天花板二分到 ctxprobe 的 256 步進，在 61,440 和 69,632 之間；
+- 用會二分的 ctxprobe 把兩張卡的天花板收斂到 256 步進，在 61,440 和 69,632 之間；
   以及 q8_0 KV 之下的同一個數字。
 - 69,632 配 `-ub` 128：在稀疏注意力模型上，更小的 ubatch 能不能拿 prefill 換 context。
 - DeepSeek-V4-Flash 的 131,072 在 95% 填充下。它從沒被驗證過，而它有同一類的 indexer。

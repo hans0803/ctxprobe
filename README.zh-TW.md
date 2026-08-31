@@ -44,6 +44,8 @@ Largest context that actually runs: 34816 tokens
 不到兩分鐘。注意 `died@64`：35072 **載入成功、18-token 的 prompt 也能全速生成**，
 卻死在一個 64-token 的 prompt 上 —— 這一行是任何載入期估算都產生不出來的。
 接著勝出者會再用完整長度的 prompt 驗證一次，它的速度數字就來自那一輪。
+如果那次驗證失敗 —— 階梯過了、滿視窗卻撐不住，帶 indexer 的稀疏注意力模型會這樣 ——
+搜尋會在它底下再二分一次，每個探測點都用完整長度驗證，回報真正撐得住的那個大小。
 
 ## 為什麼需要這個
 
@@ -241,7 +243,7 @@ ctxprobe MODEL.gguf [選項] [-- 額外的 llama-server 參數]
 | GPU | 模型 | 量化 | KV | 最大 context | Prefill | 生成 |
 |---|---|---|---|---|---|---|
 | RTX 5090 32GB | DeepSeek-V4-Flash | UD-IQ4_XS | q8_0 | 131,072 ‡ | 775 tok/s | 13.3 tok/s |
-| RTX 5090 32GB | Qwen3.8-Flash-Next | UD-IQ4_XS | f16 | — ¶ | 1040 tok/s | 35.5 tok/s |
+| RTX 5090 32GB | Qwen3.8-Flash-Next | UD-IQ4_XS | f16 | 48,128 ¶ | 1040 tok/s | 35.5 tok/s |
 | 2× RTX 5090 32GB | Qwen3.8-Flash-Next | UD-IQ4_XS | f16 | 61,440 ¶ | 1527 tok/s | 83 tok/s |
 | RTX 5060 Ti 16GB | Gemma4-26B-A4B | QAT q4_0 | q8_0 | **105,984** | 1890 tok/s | 50.8 tok/s |
 | RTX 5060 Ti 16GB | Qwen3.6-27B | IQ4_XS | q8_0 | 34,816 | 858 tok/s | 24.6 tok/s |
@@ -263,10 +265,11 @@ Prefill 是 `-ub 8192` 的數字；預設的 512 只有 151 tok/s。
 
 ¶ 176.9 B 參數、87 GiB，跑在尚未合併的 llama.cpp（PR #27742）上。
 單卡的 prefill 和生成來自兩種不能共存的 expert 擺法：生成是 `-ncmoe 28` / `-ub 512`，
-prefill 是 `-ncmoe 36` / `-ub 8192`；單卡的天花板沒有量。兩張卡：`-ncmoe 2`，
-生成在 8K、prefill 在 `-ub 1024`；天花板是在 `-ncmoe 4 --tensor-split 26,22` 之下，
-61,440 通過填充驗證，是夾出來的區間不是二分到底 —— 階梯原本說 91,648，
-那一頁有一部分就在講它為什麼錯：
+prefill 是 `-ncmoe 36` / `-ub 8192`；天花板在 `-ncmoe 30` / `-ub 2048` 之下，
+由 ctxprobe 現在在滿視窗失敗時會跑的二分找出來（階梯原本說 81,920）。
+兩張卡：`-ncmoe 2`，生成在 8K、prefill 在 `-ub 1024`；天花板在 `-ncmoe 4 --tensor-split 26,22`
+之下，61,440 通過填充驗證，是那個修正存在之前用手夾出來的 —— 階梯原本說 91,648。
+那一頁有一部分就在講階梯為什麼錯：
 [rtx5090-32gb-qwen3.8-flash-next.zh-TW.md](results/rtx5090-32gb-qwen3.8-flash-next.zh-TW.md)。
 
 § **量化的名字決定不了 bits。** `UD-IQ4_XS` 是每權重 4.1703 bits，
