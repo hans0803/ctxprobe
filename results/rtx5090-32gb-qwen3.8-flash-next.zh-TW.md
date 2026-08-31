@@ -395,9 +395,16 @@ ggml_cuda_op_top_k
 [gotcha #4](../docs/gotchas.zh-TW.md) 說它們不會 —— 階梯之所以成立，
 是因為 buffer 跟的是 batch 形狀不是 context —— 對 dense attention 它是對的。
 帶學習型 indexer 的稀疏注意力是例外。這對工具有兩個後果：在這個架構上 4096 那階
-不能當作滿視窗的代理，所以搜尋該把 fill-validated 的天花板二分出來，而不是退兩步就停；
-以及 [DeepSeek-V4-Flash 的 131,072](rtx5090-32gb-deepseek-v4-flash.zh-TW.md) ——
-DSA、階梯驗證過、從未填充驗證 —— 在有人真的填滿它之前，同樣可疑。
+不能當作滿視窗的代理，所以搜尋該把 fill-validated 的天花板二分出來，而不是退兩步就停 ——
+ctxprobe 現在會這樣做了，下一小節就是它的第一次執行。
+
+但這**不**代表這個專案上每一個稀疏注意力的天花板都是錯的。
+[DeepSeek-V4-Flash 的 131,072](rtx5090-32gb-deepseek-v4-flash.zh-TW.md)
+階梯驗證過、從未填充驗證，所以它是最明顯的下一個嫌疑犯；
+填滿之後它通過了（124,075 個 token，數字沒變）。
+它的 indexer 很可能有同樣的成長性質，但那個配置的峰值是 15,469 / 32,109 ——
+有 16 GB 的餘裕讓它去長，而這裡只有 10 MiB。
+**會隨視窗長大的 buffer，只有在卡滿的時候才會變成天花板。**
 
 ### 把真正的天花板夾出來
 
@@ -637,5 +644,4 @@ Prefill 到第十三個還在爬。一部分是 50 個字的詞表：只有 2,50
 - 用會二分的 ctxprobe 把兩張卡的天花板收斂到 256 步進，在 61,440 和 69,632 之間；
   以及 q8_0 KV 之下的同一個數字。
 - 69,632 配 `-ub` 128：在稀疏注意力模型上，更小的 ubatch 能不能拿 prefill 換 context。
-- DeepSeek-V4-Flash 的 131,072 在 95% 填充下。它從沒被驗證過，而它有同一類的 indexer。
 - `UD-Q3_K_XL` 在 `-ncmoe 0`：88 tok/s 的地板，以及約 1,700 tok/s 的 prefill 外推。

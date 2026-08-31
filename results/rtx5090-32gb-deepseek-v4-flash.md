@@ -47,10 +47,35 @@ attention, embeddings and shared experts.
 ended after two boots because the upper bound itself passed. The model declares
 1,048,576.
 
-⚠️ **Both figures cleared the prompt ladder (64/512/4096) but not the 95% fill
-validation.** At 153 tok/s the validating prompt for 131,072 needs 124K tokens of
-prefill — 13 minutes — so it was stopped. Treat 131,072 as *ladder-verified,
-unconfirmed*. The ubatch findings below make that validation practical again.
+Those two rows cleared the prompt ladder (64/512/4096) but not, at the time,
+the 95% fill validation: at 153 tok/s the validating prompt for 131,072 needs
+124K tokens of prefill — 13 minutes — so it was stopped, and 131,072 stood as
+*ladder-verified, unconfirmed*.
+
+**Confirmed 2026-08-31**, with the ubatch finding below making it practical
+(775 tok/s instead of 153) and a ctxprobe that bisects when a full window
+fails:
+
+```
+Validating 131072 at 95% fill...
+  confirmed: 131072 (124075 tokens filled)
+  peak VRAM 15469 MiB | prefill 653.41 tok/s | generate 11.92 tok/s
+```
+
+Two and a half minutes, at `-ub 8192`. The ladder was right here. It is worth
+saying why, because on [Qwen3.8-Flash-Next
+](rtx5090-32gb-qwen3.8-flash-next.md) — also sparse attention, also an indexer
+whose scratch grows with `n_kv` — the ladder overstated a ceiling by 41%. The
+difference is not the mechanism, it is the slack: this configuration peaks at
+15,469 MiB of 32,109, so whatever the indexer's working set does with a 124K
+window, there are 16 GB for it to do it in. Qwen3.8-Flash-Next was measured
+with 10 MiB spare. **A growing buffer only becomes a ceiling on a full card.**
+
+The validated speeds are lower than the table's, as they should be: 653 tok/s
+prefill and 11.92 tok/s generate against a 124K-token window, versus 154 and
+13.32 measured at `-ub 512` against a short one. Peak VRAM is 15,469 rather
+than 10,441 for the same reason the ubatch table shows — the compute buffer is
+sized by `-ub`, and this ran at 8192.
 
 KV cost works out at about **12.3 KB per token** (from the 1,514 MiB gap between
 the two rows). MLA is extraordinarily cheap here: Qwen3.6-27B costs 34 MiB per

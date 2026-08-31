@@ -436,10 +436,16 @@ works because buffers follow batch shape, not context — and for dense
 attention it is right. Sparse attention with a learned indexer is the
 exception. Two consequences for the tool: on this architecture the 4096 rung
 is not a proxy for a full window, so the search should bisect the
-fill-validated ceiling rather than stop after two back-offs; and
-[DeepSeek-V4-Flash's 131,072](rtx5090-32gb-deepseek-v4-flash.md) — DSA,
-ladder-verified, never fill-validated — is under the same suspicion until
-someone fills it.
+fill-validated ceiling rather than stop after two back-offs — which ctxprobe
+now does, and the next subsection is the first run of it.
+
+It does *not* follow that every sparse-attention ceiling on this project is
+wrong. [DeepSeek-V4-Flash's 131,072](rtx5090-32gb-deepseek-v4-flash.md) was
+ladder-verified and never fill-validated, so it was the obvious next suspect;
+filling it confirmed it (124,075 tokens, unchanged). Its indexer very likely
+grows the same way, but that configuration peaks at 15,469 MiB of 32,109 —
+16 GB of slack for the growth to happen in, against the 10 MiB here. **A
+buffer that grows with the window is only a ceiling on a full card.**
 
 ### Bracketing the real ceiling
 
@@ -705,7 +711,5 @@ Each of these produced a clean-looking table with no signal in it.
   the bisecting ctxprobe; and the same at q8_0 KV.
 - `-ub` 128 at 69,632: whether a smaller ubatch trades prefill for context on
   a sparse-attention model.
-- DeepSeek-V4-Flash's 131,072 at 95% fill. It was never validated, and it has
-  the same kind of indexer.
 - `UD-Q3_K_XL` at `-ncmoe 0`: the 88 tok/s floor, and the ~1,700 tok/s prefill
   extrapolation.

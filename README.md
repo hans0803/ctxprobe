@@ -245,7 +245,7 @@ Without torch everything still works, you just don't get that line.
 
 | GPU | Model | Quant | KV | Max context | Prefill | Generate |
 |---|---|---|---|---|---|---|
-| RTX 5090 32GB | DeepSeek-V4-Flash | UD-IQ4_XS | q8_0 | 131,072 ‡ | 775 tok/s | 13.3 tok/s |
+| RTX 5090 32GB | DeepSeek-V4-Flash | UD-IQ4_XS | q8_0 | **131,072** ‡ | 775 tok/s | 13.3 tok/s |
 | RTX 5090 32GB | Qwen3.8-Flash-Next | UD-IQ4_XS | f16 | 48,128 ¶ | 1040 tok/s | 35.5 tok/s |
 | 2× RTX 5090 32GB | Qwen3.8-Flash-Next | UD-IQ4_XS | f16 | 61,440 ¶ | 1527 tok/s | 83 tok/s |
 | RTX 5060 Ti 16GB | Gemma4-26B-A4B | QAT q4_0 | q8_0 | **105,984** | 1890 tok/s | 50.8 tok/s |
@@ -261,7 +261,8 @@ Without torch everything still works, you just don't get that line.
 [spill-cost.md](docs/spill-cost.md).
 
 ‡ 136.66 GB model, experts in DDR5 via `--cpu-moe`; the ceiling is ctxprobe's
-search cap, and it is ladder-verified but not fill-validated. Prefill quoted at
+search cap, not the model's — it is fill-validated (124,075 tokens) and the
+model declares 1,048,576. Prefill quoted at
 `-ub 8192`; the default 512 gives 151 tok/s. **This row needs 192 GB of system
 RAM and only 12.3 GB of VRAM** — the card is the cheap half. Generate is 13.3 on
 all 32 threads, 12.07 with 2 held back for other services.

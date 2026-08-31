@@ -242,7 +242,7 @@ ctxprobe MODEL.gguf [選項] [-- 額外的 llama-server 參數]
 
 | GPU | 模型 | 量化 | KV | 最大 context | Prefill | 生成 |
 |---|---|---|---|---|---|---|
-| RTX 5090 32GB | DeepSeek-V4-Flash | UD-IQ4_XS | q8_0 | 131,072 ‡ | 775 tok/s | 13.3 tok/s |
+| RTX 5090 32GB | DeepSeek-V4-Flash | UD-IQ4_XS | q8_0 | **131,072** ‡ | 775 tok/s | 13.3 tok/s |
 | RTX 5090 32GB | Qwen3.8-Flash-Next | UD-IQ4_XS | f16 | 48,128 ¶ | 1040 tok/s | 35.5 tok/s |
 | 2× RTX 5090 32GB | Qwen3.8-Flash-Next | UD-IQ4_XS | f16 | 61,440 ¶ | 1527 tok/s | 83 tok/s |
 | RTX 5060 Ti 16GB | Gemma4-26B-A4B | QAT q4_0 | q8_0 | **105,984** | 1890 tok/s | 50.8 tok/s |
@@ -258,7 +258,8 @@ ctxprobe MODEL.gguf [選項] [-- 額外的 llama-server 參數]
 見 [spill-cost.zh-TW.md](docs/spill-cost.zh-TW.md)。
 
 ‡ 136.66 GB 的模型，expert 透過 `--cpu-moe` 放在 DDR5；
-這個上限是 ctxprobe 的搜尋上限，而且只通過階梯驗證、未做填充驗證。
+這個上限是 ctxprobe 的搜尋上限、不是模型的 —— 它已通過填充驗證（124,075 個 token），
+模型宣告的是 1,048,576。
 Prefill 是 `-ub 8192` 的數字；預設的 512 只有 151 tok/s。
 **這一行需要 192 GB 系統記憶體，卻只需要 12.3 GB 顯存** —— 顯卡是便宜的那一半。
 生成 13.3 是用滿 32 執行緒；留 2 個核心給其他服務時是 12.07。
