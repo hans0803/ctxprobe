@@ -74,7 +74,10 @@ return !fp16_mma_hardware_available(cc) || ne11 < MMQ_DP4A_MAX_BATCH_SIZE;
 
 這就是 `ctxprobe` 回報的 `PREFILL_OOM`，而 `died@64` 會指出是哪一階殺死它的。
 這個判定以前叫 `LONG_OOM` —— 那是「相信 buffer 會隨 prompt 長度成長」時期的遺留。
-它們並不會成長，而那個名字會讓人去找一個根本不存在的記憶體洩漏。
+對 dense attention 來說它們不會成長 —— 它們跟的是 batch shape ——
+而那個名字會讓人去找一個根本不存在的記憶體洩漏。
+但對帶 indexer 的稀疏注意力來說它們**會**，那就是
+[#11](#11-稀疏注意力之下階梯有一個盲區)，也是「光靠階梯不是完整測試」的原因。
 
 **64 不是唯一會觸發的那一階。** 階梯爬 64 → 512 → 4096 是有理由的：
 512 是 `n_ubatch`、也就是第一個完整的微批，4096 則跨過 `n_batch`（2048）。
@@ -256,3 +259,52 @@ grep -cE 'libcuda|libnvidia-encode' /proc/<pid>/maps   # 要是 0
 延伸閱讀：[model-quant.zh-TW.md](model-quant.zh-TW.md) 談怎麼挑一個裝得下的量化，
 [kv-cache-quant.zh-TW.md](kv-cache-quant.zh-TW.md) 談怎麼把隨 context 成長的
 cache 砍半。
+
+## 11. 稀疏注意力之下，階梯有一個盲區
+
+上面所有東西都建立在一個前提上：buffer 的大小跟的是 **batch shape**，
+所以一個 4096 token 的 prompt 配置出來的大小，跟一個 90,000 token 的一樣。
+對 dense attention 這是對的。對帶學習型 indexer 的稀疏注意力這是錯的，
+而在那裡，階梯會給你一個充滿自信的錯誤數字。
+
+Qwen3.8-Flash-Next，一張 RTX 5090，`-ncmoe 30 -ub 2048`，f16 KV。
+階梯把 81,920 以下的每一個大小都放行了。一個灌滿視窗 95% 的 prompt 死了：
+
+```
+ggml_cuda_op_top_k
+  -> argsort_f32_i32_cuda_cub
+    -> ggml_cuda_pool_vmm::alloc     CUDA error: out of memory
+```
+
+那是 QSA 的 indexer。它替 ubatch 裡的每一個 query 列對每一個已快取的 block 打分數、
+排序、留下 `indexer.top_k` 個。分數 tensor、它的 graph buffer、排序的暫存區，
+全部隨 **n_kv × n_ubatch** 長大 —— 隨著快取裡已經有多少 context。
+在 `top_k + compress_ratio − 1` 以下，選的是全部，這條路徑在結構上就是 dense；
+超過之後，工作集隨視窗裡的每一個 token 長大。
+
+所以 4096 那一階**有**走到 sparse 路徑 —— 只是把它配置成 n_kv ≈ 4K 的大小。
+一個 87K 的 prompt 要 20 倍，然後在 prefill 進行到約 5,000 個 token 時死掉，
+而階梯在 2.9 秒之前才剛放行它。
+
+**階梯說 81,920。滿視窗撐得住的是 48,128。高估了 41%。**
+
+有兩個推論。
+
+**它只有在卡滿的時候才是天花板。** DeepSeek-V4-Flash 有同一類的 indexer，
+而它的 131,072 通過了填充驗證 —— 因為那個配置的峰值是 15,469 / 32,109。
+有 16 GB 的餘裕讓它去長，而上面那一輪只有 10 MiB。
+成長是架構的性質；它會不會變成天花板，是擺法的性質。
+
+**ctxprobe 處理得了，但有代價。** 驗證失敗現在會在階梯的答案底下二分，
+每個探測點都用完整長度驗證。它的上界是 log₂(範圍/步進) ——
+上面那一輪是八個探測點、約半小時，每一個都是一次完整啟動加 40–55K token 的 prefill。
+那就是在這個架構上一個誠實的天花板要付的錢，而且兩個數字不同時，報告會同時印出來：
+
+```
+confirmed: 48128 — the ladder had said 81920, 33792 tokens too high
+```
+
+如果你直接讀 `results.tsv`，通過填充驗證的列前綴是 `final:`；
+在 `--json` 裡，比對 `max_context` 和 `ladder_max_context`。
+
+完整實測：[rtx5090-32gb-qwen3.8-flash-next.zh-TW.md](../results/rtx5090-32gb-qwen3.8-flash-next.zh-TW.md)。

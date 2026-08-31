@@ -132,6 +132,14 @@ emitted tokens. The **winner alone** is then re-booted and given a prompt fillin
 95% of the window — the number that gets reported is still backed by a full-size
 prompt, and that second boot doubles as an independent re-run of the ceiling.
 
+That last step is not a formality. The ladder's premise is that buffers follow
+batch shape, so 4096 tokens size them the way 90,000 would. Sparse attention
+with a learned indexer breaks it: its selection scratch grows with the tokens
+already cached, and on one model the ladder cleared 81,920 while a full window
+held 48,128 — **41% high**. That is why a failed validation bisects instead of
+shrugging, and why the report prints both numbers when they differ.
+[gotchas.md](docs/gotchas.md) #11 has the backtrace and the arithmetic.
+
 That 95% is measured, not estimated: the length is converged on using the
 server's own `/v1/chat/completions/input_tokens` endpoint, so it accounts for the
 chat template wrapper — exactly what tips a near-full prompt over the limit. The
@@ -188,11 +196,12 @@ cparams.n_ctx = GGML_PAD(cparams.n_ctx, 256);
 So `-c 35000` silently becomes 35072. Searching in steps of 1024 (a natural
 habit) skips three testable points every step; ctxprobe's default step is 256.
 
-Seven more are in [gotchas.md](docs/gotchas.md): why a short prompt cannot
+Eight more are in [gotchas.md](docs/gotchas.md): why a short prompt cannot
 qualify a context size, why `PEAK_VRAM` can never tell you what is about to
 fail, thinking models returning empty output, `n_ubatch` 512 as a bad MoE
 default, `--tensor-split` failing to place MoE experts, desktop processes
-squatting on the card, and short generations that look like findings.
+squatting on the card, short generations that look like findings, and the one
+case where the prompt ladder itself is not enough.
 
 ## Usage
 

@@ -75,8 +75,11 @@ GPU generation as much as of llama.cpp.
 
 This is what `ctxprobe` reports as `PREFILL_OOM`, with `died@64` naming the rung
 that killed it. It used to be called `LONG_OOM`, which was a leftover from
-believing the buffers grew with prompt length — they don't, and the name sent
-people looking for a memory leak that isn't there.
+believing the buffers grew with prompt length. For dense attention they don't —
+they follow batch shape — and the name sent people looking for a memory leak
+that isn't there. For sparse attention with an indexer they do, which is
+[#11](#11-on-sparse-attention-the-ladder-has-a-blind-spot) and the reason the
+ladder alone is not the whole test.
 
 **64 is not the only rung that fires.** The ladder climbs 64 → 512 → 4096 for a
 reason: 512 is `n_ubatch`, the first full micro-batch, and 4096 clears `n_batch`
@@ -264,3 +267,56 @@ Multi-GPU placement is out of scope; `llama-fit-params` handles it.
 See also: [model-quant.md](model-quant.md) for picking a quant that fits, and
 [kv-cache-quant.md](kv-cache-quant.md) for halving the cache that grows with
 context.
+
+## 11. On sparse attention, the ladder has a blind spot
+
+Everything above rests on one premise: a buffer's size follows **batch shape**,
+so a 4096-token prompt sizes it the same way a 90,000-token one would. That is
+true for dense attention. It is false for sparse attention with a learned
+indexer, and there the ladder will hand you a number that is confidently wrong.
+
+Qwen3.8-Flash-Next, one RTX 5090, `-ncmoe 30 -ub 2048`, f16 KV. The ladder
+cleared every size up to 81,920. A prompt filling 95% of the window died:
+
+```
+ggml_cuda_op_top_k
+  -> argsort_f32_i32_cuda_cub
+    -> ggml_cuda_pool_vmm::alloc     CUDA error: out of memory
+```
+
+That is the QSA indexer. It scores every cached block for every query row of
+the ubatch, sorts, and keeps `indexer.top_k`. The score tensor, its graph
+buffer and the sort's scratch all scale with **n_kv × n_ubatch** — with how
+much context is already in the cache. Below `top_k + compress_ratio − 1` the
+selection is total and the path is dense by construction; above it, the working
+set grows with every token in the window.
+
+So the 4096 rung does reach the sparse path — and sizes it for n_kv ≈ 4K. An
+87K prompt needs twenty times that, and dies about 5,000 tokens into a prefill
+that the ladder cleared 2.9 seconds earlier.
+
+**The ladder said 81,920. A full window holds 48,128. It was 41% high.**
+
+Two things follow.
+
+**It is a ceiling only on a full card.** DeepSeek-V4-Flash has the same class
+of indexer and its 131,072 is fill-validated — because that configuration peaks
+at 15,469 MiB of 32,109. Sixteen gigabytes of slack for the growth to happen
+in, against ten megabytes on the run above. The growth is a property of the
+architecture; whether it becomes a ceiling is a property of the placement.
+
+**ctxprobe handles it, at a price.** A failed validation now bisects below the
+ladder's answer, validating every probe at full length. It is bounded by
+log₂(range/step) — eight probes for the run above, about half an hour, each one
+a full boot and a 40–55K-token prefill. That is what an honest ceiling costs on
+this architecture, and the report prints both numbers when they differ:
+
+```
+confirmed: 48128 — the ladder had said 81920, 33792 tokens too high
+```
+
+If you are reading `results.tsv` directly, the fill-validated rows are the ones
+prefixed `final:`; in `--json`, compare `max_context` against
+`ladder_max_context`.
+
+Full run: [rtx5090-32gb-qwen3.8-flash-next.md](../results/rtx5090-32gb-qwen3.8-flash-next.md).

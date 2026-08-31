@@ -132,6 +132,14 @@ prompt 階梯就是利用這一點：依序爬 64 → 512 → 4096 → 完整長
 最後回報的那個數字仍然由完整長度的 prompt 背書，
 而這第二次啟動同時也是對這個上限的一次獨立重測。
 
+最後這一步不是形式。階梯的前提是 buffer 跟著 batch shape 走，
+所以 4096 個 token 配置出來的大小，跟 90,000 個一樣。
+帶學習型 indexer 的稀疏注意力打破了它：它的選擇暫存區隨快取裡已有的 token 長大，
+而在某個模型上，階梯放行了 81,920、滿視窗撐得住的卻是 48,128 —— **高估 41%**。
+這就是為什麼驗證失敗會往下二分而不是聳肩，
+以及為什麼兩個數字不同時報告會同時印出來。
+backtrace 和算式在 [gotchas.zh-TW.md](docs/gotchas.zh-TW.md) 的 #11。
+
 那個 95% 是量出來的、不是估的 —— 長度透過伺服器自己的
 `/v1/chat/completions/input_tokens` 端點迭代逼近，所以連 chat template 的包裝都算進去了，
 而那層包裝正好就是把「接近滿」的 prompt 推過界的元兇。
@@ -186,11 +194,12 @@ cparams.n_ctx = GGML_PAD(cparams.n_ctx, 256);
 所以 `-c 35000` 會被靜靜變成 35072。用 1024 當步進（很自然的習慣）每一階會跳過
 三個可測的點；ctxprobe 預設步進是 256。
 
-另外七個坑收在 [gotchas.zh-TW.md](docs/gotchas.zh-TW.md)：
+另外八個坑收在 [gotchas.zh-TW.md](docs/gotchas.zh-TW.md)：
 為什麼短 prompt 認證不了一個 context 大小、
 為什麼 `PEAK_VRAM` 永遠告訴不了你什麼快要失敗、thinking 模型回傳空輸出、
 `n_ubatch` 512 對 MoE 是個糟糕的預設、`--tensor-split` 放不好 MoE expert、
-桌面程序佔住顯卡、以及看起來像發現的短生成量測。
+桌面程序佔住顯卡、看起來像發現的短生成量測、
+以及唯一一種「連 prompt 階梯本身都不夠」的情況。
 
 ## 用法
 
