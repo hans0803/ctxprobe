@@ -304,8 +304,9 @@ Speeds come from a window-filling prompt, so they describe a loaded window
 rather than an empty one. Don't read the f16 row as "f16 generates faster" —
 it sits at 20K context against 34K, and generation slows as the window fills.
 
-Contributions for other cards welcome; `--json` output is meant to be pasted
-straight in.
+Contributions for other cards welcome — `--json` output is meant to be pasted
+straight into an issue. [CONTRIBUTING.md](CONTRIBUTING.md) says what to send
+with it and documents the schema.
 
 ## Scope
 

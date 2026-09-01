@@ -47,7 +47,9 @@ val() {  # val <flag> <value?> — reject a missing or non-numeric argument
   [[ -n "${2:-}" ]] || die "$1 needs a value"
   case "$1" in
     --kv) ;;
-    *) [[ "$2" =~ ^[0-9]+$ ]] || die "$1 needs a number, got: $2" ;;
+    # A leading zero would reach bash arithmetic as an octal literal, where 08
+    # is a syntax error rather than eight, so reject it at the boundary.
+    *) [[ "$2" =~ ^(0|[1-9][0-9]*)$ ]] || die "$1 needs a number without a leading zero, got: $2" ;;
   esac
   printf '%s' "$2"
 }
@@ -78,7 +80,7 @@ done
 [[ -f "$MODEL" ]] || die "model not found: $MODEL"
 (( FILL >= 1 && FILL <= 100 )) || die "--fill must be between 1 and 100, got: $FILL"
 
-LLAMA_BIN="${LLAMA_SERVER:-$(command -v llama-server || echo "$HOME/llama.cpp/build/bin/llama-server")}"
+LLAMA_BIN="${LLAMA_SERVER:-$(command -v llama-server || echo "${HOME:-}/llama.cpp/build/bin/llama-server")}"
 [[ -x "$LLAMA_BIN" ]] || die "llama-server not found. Set LLAMA_SERVER=/path/to/llama-server"
 command -v nvidia-smi >/dev/null || die "nvidia-smi not found (NVIDIA GPU required)"
 command -v python3   >/dev/null || die "python3 required"
@@ -109,7 +111,7 @@ read_usable() {
 print(int(torch.cuda.mem_get_info()[1] / 2**20))'
   local py
   for py in "${CTXPROBE_PYTHON:-}" python3 \
-            "$HOME/miniconda3/envs/"*/bin/python "$HOME/venv/bin/python" ; do
+            "${HOME:-}/miniconda3/envs/"*/bin/python "${HOME:-}/venv/bin/python" ; do
     [[ -n "$py" && -x "$(command -v "$py" 2>/dev/null)" ]] || continue
     local v; v=$("$py" -c "$snippet" 2>/dev/null)
     [[ -n "$v" ]] && { echo "$v"; return 0; }
@@ -176,14 +178,22 @@ PY
   [[ -n "$MAX" ]] || MAX=32768
 fi
 
+(( STEP > 0 )) || die "--step must be at least 1"
 round_step() { echo $(( ($1 / STEP) * STEP )); }
-MIN=$(round_step "$MIN"); MAX=$(round_step "$MAX")
+# Round the bounds *inward*: a search that reported a size below the requested
+# --min would be answering a question that wasn't asked.
+MIN=$(( ((MIN + STEP - 1) / STEP) * STEP ))
+MAX=$(round_step "$MAX")
 (( MIN >= STEP )) || MIN=$STEP
-(( MAX > MIN )) || die "--max ($MAX) must exceed --min ($MIN)"
+(( MAX >= MIN )) || die "--max ($MAX) is below --min ($MIN) once both are rounded to --step ($STEP)"
 
 # Only ever kill the server this script started. Matching on the port would also
 # take out a server the user is running themselves, and the trap fires on Ctrl-C.
 CURRENT_SRV=""
+# Only the run that created it may remove it: a loser releasing the winner's
+# lock would let a third run in while the winner is still on the port.
+release_lock() { (( ${HOLD_LOCK:-0} )) && rmdir "${PORT_LOCK:-}" 2>/dev/null; return 0; }
+
 cleanup() {
   [[ -n "$CURRENT_SRV" ]] || return 0
   kill "$CURRENT_SRV" 2>/dev/null
@@ -192,13 +202,24 @@ cleanup() {
   CURRENT_SRV=""
   sleep 1
 }
-trap cleanup EXIT INT TERM
+trap 'cleanup; release_lock' EXIT INT TERM
 
 # Refuse to start rather than fight over a port something else owns.
 if (exec 3<>"/dev/tcp/127.0.0.1/$PORT") 2>/dev/null; then
   exec 3<&-
   die "port $PORT is already in use — pass --port to choose another"
 fi
+
+# The check above is a moment in time, and two ctxprobes racing both pass it:
+# the loser's server fails to bind, but its health check and its whole ladder
+# reach the winner's server and come back PASS for a configuration that never
+# ran. mkdir is atomic, so only one run holds a given port.
+PORT_LOCK="${TMPDIR:-/tmp}/ctxprobe-port-$PORT.lock"
+HOLD_LOCK=0
+if ! mkdir "$PORT_LOCK" 2>/dev/null; then
+  die "another ctxprobe holds port $PORT ($PORT_LOCK) — pass --port to choose another"
+fi
+HOLD_LOCK=1
 
 RESULTS_TSV="$OUT/results.tsv"
 printf 'context\tresult\tpeak_vram_mib\tprefill_tps\tgenerate_tps\tprompt_tokens\n' > "$RESULTS_TSV"
@@ -231,7 +252,27 @@ try_ctx() {
     kill -0 $srv 2>/dev/null || break
     local u; u=$(smi --query-gpu=memory.used --format=csv,noheader,nounits | head -1)
     (( u > peak )) && peak=$u
-    if curl -sf --max-time 2 "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; then ready=yes; break; fi
+    if curl -sf --max-time 2 "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; then
+      # A healthy answer is not proof it came from our child: it dies a moment
+      # after failing to bind, so the check above can pass while the reply came
+      # from whatever already owned the port. /props reports the context the
+      # answering server was actually started with.
+      local served; served=$(curl -sf --max-time 5 "http://127.0.0.1:$PORT/props" 2>/dev/null \
+        | python3 -c 'import json,sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+for k in ("n_ctx", "default_generation_settings"):
+    v = d.get(k)
+    if isinstance(v, int): print(v); break
+    if isinstance(v, dict) and isinstance(v.get("n_ctx"), int): print(v["n_ctx"]); break' 2>/dev/null)
+      if [[ -n "$served" ]] && (( served != ctx )); then
+        cleanup
+        echo -e "LOAD_FAIL\t$peak\t\t"; return 1
+      fi
+      ready=yes; break
+    fi
     sleep 2
   done
 
@@ -411,7 +452,11 @@ emit() {  # ctx verdict peak prefill gen filled
 BEST=0; BEST_PRE=""; BEST_GEN=""; BEST_PEAK=""
 
 if [[ -n "$LIST" ]]; then
-  for c in $LIST; do
+  # Word-split on whitespace only: unquoted expansion would glob and would let
+  # arithmetic through, so "3*" could probe a filename.
+  read -ra _list <<< "$LIST"
+  for c in "${_list[@]}"; do
+    [[ "$c" =~ ^(0|[1-9][0-9]*)$ ]] || die "--list takes numbers, got: $c"
     c=$(round_step "$c")
     IFS=$'\t' read -r v p pre gen fl < <(try_ctx "$c")
     emit "$c" "$v" "$p" "$pre" "$gen" "$fl"
@@ -485,8 +530,22 @@ if (( BEST > 0 )); then
     # hi is known to fail at fill. lo starts one step under the search floor,
     # meaning "nothing known below"; it becomes a real floor only once a probe
     # passes at fill. Every probe here is a full boot plus a FILL% prompt.
-    hi=$BEST; lo=$(( MIN - STEP )); LO_OK=0; _n=0
-    while (( hi - lo > STEP && _n < 12 )); do
+    # Floor: one step below the smallest size this run would ever have tried,
+    # so --list (which ignores MIN) does not make the bisection skip past the
+    # answer. Cap: derived from the range, since a small --step over a wide one
+    # needs more than a constant number of halvings.
+    local floor=$MIN
+    if [[ -n "$LIST" ]]; then
+      floor=$BEST
+      for c in "${_list[@]}"; do (( c < floor )) && floor=$c; done
+      floor=$(( (floor / STEP) * STEP ))
+      (( floor >= STEP )) || floor=$STEP
+    fi
+    hi=$BEST; lo=$(( floor - STEP )); LO_OK=0; _n=0
+    local _cap=1 _span=$(( (hi - lo) / STEP ))
+    while (( _span > 1 )); do _span=$(( _span / 2 )); _cap=$(( _cap + 1 )); done
+    (( _cap < 4 )) && _cap=4
+    while (( hi - lo > STEP && _n < _cap )); do
       mid=$(( (lo + hi) / 2 )); mid=$(( mid / STEP * STEP ))
       (( mid <= lo )) && mid=$(( lo + STEP ))
       (( mid >= hi )) && break
@@ -570,8 +629,10 @@ else
     echo "nothing to spare. Anything else touching the card — a desktop, a second"
     echo "process — puts it over. For day-to-day use back off a couple of steps:"
     echo
-    echo "  llama-server -m $MODEL -ngl $NGL -c $SAFE \\"
-    echo "    --cache-type-k $KV --cache-type-v $KV --parallel $PARALLEL${EXTRA[*]:+ ${EXTRA[*]}}"
+    printf '  llama-server -m %q -ngl %s -c %s \\\n' "$MODEL" "$NGL" "$SAFE"
+    printf '    --cache-type-k %s --cache-type-v %s --parallel %s' "$KV" "$KV" "$PARALLEL"
+    (( ${#EXTRA[@]} )) && printf ' %q' "${EXTRA[@]}"
+    printf '\n'
     echo
     echo "Use -c $BEST only if this GPU is doing nothing else."
     if (( EAGER == 0 )); then

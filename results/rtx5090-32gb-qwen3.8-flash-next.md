@@ -231,7 +231,9 @@ With the vLLM instance taken down for the duration, `CUDA_VISIBLE_DEVICES=0,1`,
 | `-ncmoe 4`, `--tensor-split 26,22` | 30,633 | 28,273 | 73.02 | 13.69 | PASS |
 | `-ncmoe 0`, `--tensor-split 25,23` | — | — | — | — | load fails |
 
-**Not quite — but two layers on the CPU gets 83 tok/s, 2.36× the single card.**
+**Not quite — but two layers on the CPU gets 82.8 tok/s on the default split,
+2.33× the single card's 35.53** (83.7 and 2.36× with the explicit split, which
+costs elsewhere — see below).
 And the law from the single-card sweep held across the PCIe boundary without
 adjustment: `-ncmoe 4` was predicted at 13.69 ms and measured at 13.69;
 `-ncmoe 2` predicted 12.5 and came in at 11.94–12.08. The last two layers are
