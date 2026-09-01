@@ -534,7 +534,7 @@ if (( BEST > 0 )); then
     # so --list (which ignores MIN) does not make the bisection skip past the
     # answer. Cap: derived from the range, since a small --step over a wide one
     # needs more than a constant number of halvings.
-    local floor=$MIN
+    floor=$MIN
     if [[ -n "$LIST" ]]; then
       floor=$BEST
       for c in "${_list[@]}"; do (( c < floor )) && floor=$c; done
@@ -542,7 +542,7 @@ if (( BEST > 0 )); then
       (( floor >= STEP )) || floor=$STEP
     fi
     hi=$BEST; lo=$(( floor - STEP )); LO_OK=0; _n=0
-    local _cap=1 _span=$(( (hi - lo) / STEP ))
+    _cap=1; _span=$(( (hi - lo) / STEP ))
     while (( _span > 1 )); do _span=$(( _span / 2 )); _cap=$(( _cap + 1 )); done
     (( _cap < 4 )) && _cap=4
     while (( hi - lo > STEP && _n < _cap )); do
