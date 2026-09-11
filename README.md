@@ -273,9 +273,10 @@ Without torch everything still works, you just don't get that line.
 † Does not fit: only 28 of 65 layers on the GPU, the rest in system RAM. See
 [spill-cost.md](docs/spill-cost.md).
 
-‡ 136.66 GB model, experts in DDR5 via `--cpu-moe`; the ceiling is ctxprobe's
-search cap, not the model's — it is fill-validated (124,075 tokens) and the
-model declares 1,048,576. Prefill quoted at
+‡ 136.66 GB model, experts in DDR5 via `--cpu-moe`; the ceiling was ctxprobe's
+search cap at the time (since raised to 262,144), not the model's — it is
+fill-validated (124,075 tokens), the model declares 1,048,576, and the row is a
+lower bound until re-measured. Prefill quoted at
 `-ub 8192`; the default 512 gives 151 tok/s. **This row needs 192 GB of system
 RAM and only 12.3 GB of VRAM** — the card is the cheap half. Generate is 13.3 on
 all 32 threads, 12.07 with 2 held back for other services.

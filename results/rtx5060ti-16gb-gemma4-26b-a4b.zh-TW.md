@@ -117,8 +117,9 @@ context 的差距則來自 sliding-window attention。
 權重從 14.44 GB 掉到約 2.4 GB。
 
 騰出這麼多顯存之後，這張 8GB 卡跑得動 **131,072 context** ——
-那是工具的搜尋上限，不是模型的極限 ——
-prefill 612 tok/s、生成 24.6 tok/s。
+那是當時 ctxprobe 的搜尋上限，不是模型的極限 ——
+prefill 612 tok/s、生成 24.6 tok/s。上限後來已提高到 262,144；
+在重新量測之前，這個數字是一個下界。
 一個 26B 模型，在 8GB 上，128K context。
 
 ### 為什麼沒有更慢
@@ -158,6 +159,6 @@ MoE 在這裡的優勢不只是「啟用的參數少」，
 ctxprobe gemma-4-26B-A4B-it-qat-q4_0.gguf --min 8192
 ```
 
-`--max` 來自 GGUF metadata（262144，被上限截到 131072）。
+`--max` 來自 GGUF metadata（262144，被當時的 ctxprobe 截到 131072；現在的上限是 262144）。
 不需要 `--reasoning-budget` —— Gemma 4 不是 thinking 模型，
 過程中也沒有出現任何 `SILENT` 判定。

@@ -118,9 +118,10 @@ the 8GB one):
 cutting layers doesn't remove the bulk. Moving experts by tensor type does:
 weights drop from 14.44 GB to about 2.4 GB.
 
-With that much VRAM freed, the 8GB card runs **131,072 context** — the tool's
-search cap, not the model's limit — at 612 tok/s prefill and 24.6 tok/s generate.
-A 26B model, on 8GB, at 128K context.
+With that much VRAM freed, the 8GB card runs **131,072 context** — ctxprobe's
+search cap at the time, not the model's limit — at 612 tok/s prefill and 24.6
+tok/s generate. A 26B model, on 8GB, at 128K context. The cap has since been
+raised to 262,144; this number is a lower bound until it is re-measured.
 
 ### Why it isn't slower
 
@@ -158,6 +159,7 @@ the ones you can evict.
 ctxprobe gemma-4-26B-A4B-it-qat-q4_0.gguf --min 8192
 ```
 
-`--max` comes from the GGUF metadata (262144, capped to 131072). No
+`--max` came from the GGUF metadata (262144, capped to 131072 by the ctxprobe
+of the day; the cap is now 262144). No
 `--reasoning-budget` needed — Gemma 4 is not a thinking model, and no `SILENT`
 verdicts appeared.
