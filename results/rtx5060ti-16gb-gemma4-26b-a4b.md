@@ -2,7 +2,7 @@
 
 **English** · [繁體中文](rtx5060ti-16gb-gemma4-26b-a4b.zh-TW.md)
 
-Measured 2026-08-11. Same card and same tool as the
+Measured 2026-08-11; the 8GB section re-measured 2026-09-11. Same card and same tool as the
 [Qwen3.6-27B run](rtx5060ti-16gb-qwen3.6-27b.md), which makes this the first
 independent check on whether the failure thresholds found there belong to
 llama.cpp or to that particular model.
@@ -118,10 +118,30 @@ the 8GB one):
 cutting layers doesn't remove the bulk. Moving experts by tensor type does:
 weights drop from 14.44 GB to about 2.4 GB.
 
-With that much VRAM freed, the 8GB card runs **131,072 context** — ctxprobe's
-search cap at the time, not the model's limit — at 612 tok/s prefill and 24.6
-tok/s generate. A 26B model, on 8GB, at 128K context. The cap has since been
-raised to 262,144; this number is a lower bound until it is re-measured.
+With that much VRAM freed, the 8GB card runs the model's **full 262,144
+context** — that is Gemma 4's trained limit, not a memory edge:
+
+| Context | Result | Peak VRAM | Model's own | Prefill | Generate | Filled |
+|---|---|---|---|---|---|---|
+| 131,072 | PASS | 12,168 MiB | 4,117 MiB | 700 tok/s | 38.6 tok/s | 4,038 |
+| 262,144 | PASS | 14,168 MiB | 6,117 MiB | 702 tok/s | 39.0 tok/s | 4,038 |
+| **262,144** | **PASS at 95% fill** | 14,168 MiB | 6,117 MiB | **501 tok/s** | **17.95 tok/s** | **249,013** |
+
+"Model's own" subtracts the 8,051 MiB the holding process and its CUDA context
+occupied. At the full window the model uses 6.1 GB of the 7.8 GB budget, so
+there is 1.7 GB to spare when the model itself runs out of context. A 26B
+model, on 8GB, at 256K — with room. The 249K-token prompt took 497 s, inside
+ctxprobe's 900 s floor, so the time budget never came into it.
+
+Generate at a full window is 17.95 tok/s against 39 on an empty one. That is
+the same shape as the 16GB run's 120 → 50.8: five full-attention layers still
+attend over the whole cache while the other 25 stop at their sliding window.
+KV grows 2,000 MiB per 131,072 tokens here — 15.3 MiB per 1K, a sixth of what
+the same 30 layers would need with global attention in every one of them.
+
+The August run reported 131,072 for this configuration. That was ctxprobe's
+search cap at the time, not a measurement of the card; the cap is now 262,144
+and this section is the re-measurement.
 
 ### Why it isn't slower
 
@@ -159,7 +179,7 @@ the ones you can evict.
 ctxprobe gemma-4-26B-A4B-it-qat-q4_0.gguf --min 8192
 ```
 
-`--max` came from the GGUF metadata (262144, capped to 131072 by the ctxprobe
-of the day; the cap is now 262144). No
+`--max` comes from the GGUF metadata (262144). The 8GB section adds
+`python tools/hold-vram.py 7800 &` first and `-- --cpu-moe` at the end. No
 `--reasoning-budget` needed — Gemma 4 is not a thinking model, and no `SILENT`
 verdicts appeared.

@@ -18,7 +18,7 @@ RTX 5060 Ti 16GB 的實際輸出：
 
 ```
   model     : Qwen3.6-27B-IQ4_XS.gguf (15G)
-  gpu       : NVIDIA GeForce RTX 5060 Ti
+  gpu       : NVIDIA GeForce RTX 5060 Ti (index 0)
   vram      : 16311 MiB reported by nvidia-smi, 15 MiB already in use
               15849 MiB actually allocatable (462 MiB is driver reserve)
   kv cache  : q8_0 | slots: 1 | step: 256 | winner validated at 95% fill
@@ -27,21 +27,21 @@ RTX 5060 Ti 16GB 的實際輸出：
 
 CONTEXT    RESULT      PEAK_VRAM   PREFILL    GENERATE   FILLED
 ------------------------------------------------------------------------
-32768      PASS        15767       968.60     28.55      4042
+32768      PASS        15767       963.46     28.54      4042
 36864      DECODE_OOM  15845       n/a        n/a        —
-34816      PASS        15845       968.55     28.55      4042
+34816      PASS        15845       964.78     28.54      4042
 35840      DECODE_OOM  15805       n/a        n/a        —
 35328      DECODE_OOM  15787       n/a        n/a        —
-35072      PREFILL_OOM 15847       94.03      26.47      died@64
+35072      PREFILL_OOM 15847       90.37      26.44      died@64
 
 Validating 34816 at 95% fill...
   confirmed: 34816 (32826 tokens filled)
 
 Largest context that actually runs: 34816 tokens
-  peak VRAM 15845 MiB | prefill 859.74 tok/s | generate 24.89 tok/s
+  peak VRAM 15845 MiB | prefill 858.99 tok/s | generate 24.86 tok/s
 ```
 
-不到兩分鐘。注意 `died@64`：35072 **載入成功、18-token 的 prompt 也能全速生成**，
+剛好兩分鐘。注意 `died@64`：35072 **載入成功、18-token 的 prompt 也能全速生成**，
 卻死在一個 64-token 的 prompt 上 —— 這一行是任何載入期估算都產生不出來的。
 接著勝出者會再用完整長度的 prompt 驗證一次，它的速度數字就來自那一輪。
 如果那次驗證失敗 —— 階梯過了、滿視窗卻撐不住，帶 indexer 的稀疏注意力模型會這樣 ——
@@ -257,6 +257,7 @@ ctxprobe MODEL.gguf [選項] [-- 額外的 llama-server 參數]
 | RTX 5090 32GB | Qwen3.8-Flash-Next | UD-IQ4_XS | f16 | 48,128 ¶ | 1040 tok/s | 35.5 tok/s |
 | 2× RTX 5090 32GB | Qwen3.8-Flash-Next | UD-IQ4_XS | f16 | 61,440 ¶ | 1527 tok/s | 83 tok/s |
 | RTX 5060 Ti 16GB | Gemma4-26B-A4B | QAT q4_0 | q8_0 | **105,984** | 1890 tok/s | 50.8 tok/s |
+| RTX 5060 Ti 8GB *（模擬）* | Gemma4-26B-A4B | QAT q4_0 | q8_0 | **262,144** ※ | 501 tok/s | 18.0 tok/s |
 | RTX 5060 Ti 16GB | Qwen3.6-27B | IQ4_XS | q8_0 | 34,816 | 858 tok/s | 24.6 tok/s |
 | RTX 5060 Ti 16GB | Qwen3.6-27B | IQ4_XS | f16 | 20,224 | 923 tok/s | 26.9 tok/s |
 | RTX 5060 Ti 16GB | Qwen3.8-27B | UD-IQ4_XS § | q8_0 | 61,952 | 740 tok/s | 23.4 tok/s |
@@ -267,6 +268,11 @@ ctxprobe MODEL.gguf [選項] [-- 額外的 llama-server 參數]
 
 † 裝不下：65 層中只有 28 層在 GPU 上，其餘在系統記憶體。
 見 [spill-cost.zh-TW.md](docs/spill-cost.zh-TW.md)。
+
+※ expert 透過 `--cpu-moe` 放在系統記憶體，模擬 8GB 的方法同 †。這不是記憶體邊界：
+262,144 是模型的訓練上限，它在 95% 填充（249,013 個 token）下通過，
+7.8 GB 預算只用了 6.1 GB。速度是那個填充度下的數字；空視窗生成是 39 tok/s。
+2026-09-11 用提高後的搜尋上限量測 —— 八月那輪停在 131,072，因為那是當時的上限。
 
 ‡ 136.66 GB 的模型，expert 透過 `--cpu-moe` 放在 DDR5；
 這個上限是當時 ctxprobe 的搜尋上限（後來已提高到 262,144）、不是模型的 ——

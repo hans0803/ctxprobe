@@ -19,7 +19,7 @@ Real output, RTX 5060 Ti 16GB:
 
 ```
   model     : Qwen3.6-27B-IQ4_XS.gguf (15G)
-  gpu       : NVIDIA GeForce RTX 5060 Ti
+  gpu       : NVIDIA GeForce RTX 5060 Ti (index 0)
   vram      : 16311 MiB reported by nvidia-smi, 15 MiB already in use
               15849 MiB actually allocatable (462 MiB is driver reserve)
   kv cache  : q8_0 | slots: 1 | step: 256 | winner validated at 95% fill
@@ -28,21 +28,21 @@ Real output, RTX 5060 Ti 16GB:
 
 CONTEXT    RESULT      PEAK_VRAM   PREFILL    GENERATE   FILLED
 ------------------------------------------------------------------------
-32768      PASS        15767       968.60     28.55      4042
+32768      PASS        15767       963.46     28.54      4042
 36864      DECODE_OOM  15845       n/a        n/a        —
-34816      PASS        15845       968.55     28.55      4042
+34816      PASS        15845       964.78     28.54      4042
 35840      DECODE_OOM  15805       n/a        n/a        —
 35328      DECODE_OOM  15787       n/a        n/a        —
-35072      PREFILL_OOM 15847       94.03      26.47      died@64
+35072      PREFILL_OOM 15847       90.37      26.44      died@64
 
 Validating 34816 at 95% fill...
   confirmed: 34816 (32826 tokens filled)
 
 Largest context that actually runs: 34816 tokens
-  peak VRAM 15845 MiB | prefill 859.74 tok/s | generate 24.89 tok/s
+  peak VRAM 15845 MiB | prefill 858.99 tok/s | generate 24.86 tok/s
 ```
 
-Under two minutes. Note `died@64`: 35072 loaded, served an 18-token prompt at
+Two minutes flat. Note `died@64`: 35072 loaded, served an 18-token prompt at
 full speed, and died on a 64-token one — the row no load-time estimate can
 produce. The winner is then re-validated against a full-length prompt, which is
 where its speed figures come from. If that validation fails — the ladder
@@ -262,6 +262,7 @@ Without torch everything still works, you just don't get that line.
 | RTX 5090 32GB | Qwen3.8-Flash-Next | UD-IQ4_XS | f16 | 48,128 ¶ | 1040 tok/s | 35.5 tok/s |
 | 2× RTX 5090 32GB | Qwen3.8-Flash-Next | UD-IQ4_XS | f16 | 61,440 ¶ | 1527 tok/s | 83 tok/s |
 | RTX 5060 Ti 16GB | Gemma4-26B-A4B | QAT q4_0 | q8_0 | **105,984** | 1890 tok/s | 50.8 tok/s |
+| RTX 5060 Ti 8GB *(simulated)* | Gemma4-26B-A4B | QAT q4_0 | q8_0 | **262,144** ※ | 501 tok/s | 18.0 tok/s |
 | RTX 5060 Ti 16GB | Qwen3.6-27B | IQ4_XS | q8_0 | 34,816 | 858 tok/s | 24.6 tok/s |
 | RTX 5060 Ti 16GB | Qwen3.6-27B | IQ4_XS | f16 | 20,224 | 923 tok/s | 26.9 tok/s |
 | RTX 5060 Ti 16GB | Qwen3.8-27B | UD-IQ4_XS § | q8_0 | 61,952 | 740 tok/s | 23.4 tok/s |
@@ -272,6 +273,12 @@ Without torch everything still works, you just don't get that line.
 
 † Does not fit: only 28 of 65 layers on the GPU, the rest in system RAM. See
 [spill-cost.md](docs/spill-cost.md).
+
+※ Experts in system RAM via `--cpu-moe`, same simulated-8GB method as †. Not a
+memory edge: 262,144 is the model's trained limit, and it passed at 95% fill
+(249,013 tokens) using 6.1 GB of the 7.8 GB budget. Speeds are at that fill; an
+empty window generates at 39 tok/s. Measured 2026-09-11 with the raised search
+cap — the August run stopped at 131,072 because that was the cap.
 
 ‡ 136.66 GB model, experts in DDR5 via `--cpu-moe`; the ceiling was ctxprobe's
 search cap at the time (since raised to 262,144), not the model's — it is
