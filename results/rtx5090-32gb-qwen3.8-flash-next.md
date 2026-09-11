@@ -713,5 +713,3 @@ Each of these produced a clean-looking table with no signal in it.
   the bisecting ctxprobe; and the same at q8_0 KV.
 - `-ub` 128 at 69,632: whether a smaller ubatch trades prefill for context on
   a sparse-attention model.
-- `UD-Q3_K_XL` at `-ncmoe 0`: the 88 tok/s floor, and the ~1,700 tok/s prefill
-  extrapolation.
