@@ -43,9 +43,10 @@ attention, embeddings and shared experts.
 | 8,192 | PASS | 8927 MiB | 153.86 tok/s | 13.28 tok/s |
 | **131,072** | **PASS** | 10441 MiB | 153.83 tok/s | 13.32 tok/s |
 
-131,072 is **ctxprobe's search cap, not the model's limit** — the binary search
-ended after two boots because the upper bound itself passed. The model declares
-1,048,576.
+131,072 was **ctxprobe's search cap at the time, not the model's limit** — the
+binary search ended after two boots because the upper bound itself passed. The
+model declares 1,048,576. The cap has since been raised to 262,144; this row is
+a lower bound until it is re-measured.
 
 Those two rows cleared the prompt ladder (64/512/4096) but not, at the time,
 the 95% fill validation: at 153 tok/s the validating prompt for 131,072 needs

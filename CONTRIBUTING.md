@@ -37,16 +37,17 @@ That is enough. You do not need to write a page.
 
 ## The JSON
 
-`--json` writes one object to stdout; progress goes to stderr. Schema 3:
+`--json` writes one object to stdout; progress goes to stderr. Schema 4:
 
 | Field | Type | Meaning |
 |---|---|---|
-| `schema` | int | Bumped when the shape changes. Currently **3**. |
+| `schema` | int | Bumped when the shape changes. Currently **4**. |
 | `model` | string | Basename of the GGUF passed in. |
 | `gpu` | string | As `nvidia-smi` names it. |
 | `max_context` | int | **The answer.** Largest context that ran. |
 | `validated_at_fill` | bool | Whether `max_context` survived a prompt filling `fill_percent` of the window. **If false, `max_context` is unconfirmed** — the ladder cleared it and a full window did not. |
 | `ladder_max_context` | int | What the 64/512/4096 ladder alone would have reported. Equal to `max_context` unless a full window failed and the search bisected down — see [gotchas.md](docs/gotchas.md) #11 for the one architecture where the gap is large. |
+| `fill_timed_out` | bool | The full-window prompt outlasted its time budget with the server still healthy. `max_context` is then unconfirmed for speed reasons, not memory — raise `-ub` or `CTXPROBE_FILL_MIN_TPS` and re-run. |
 | `peak_vram_mib` | int\|null | Highest sampled usage on the probed device during the winning run. Not a headroom estimate — [gotchas.md](docs/gotchas.md) #5. |
 | `prefill_tps` | float\|null | From the fill validation, so against a loaded window. |
 | `generate_tps` | float\|null | Same run. Decode into a nearly-full cache, not an empty one. |
@@ -71,8 +72,10 @@ rest are ladder probes, and their speeds come from whichever rung the run
 reached — so they describe a lightly-loaded window and are not comparable to
 the `final:` figures.
 
-`result` is one of `PASS`, `LOAD_FAIL`, `DECODE_OOM`, `PREFILL_OOM`, `SILENT`.
-`prompt_tokens` carries `died@N` when a rung killed the run, naming the rung.
+`result` is one of `PASS`, `LOAD_FAIL`, `DECODE_OOM`, `PREFILL_OOM`, `SILENT`,
+`TIMEOUT`.
+`prompt_tokens` carries `died@N` when a rung killed the run, naming the rung, or
+`timeout@N/Ss` when the N-token prompt did not finish inside its S-second budget.
 
 ## Changing the script
 

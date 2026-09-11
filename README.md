@@ -143,8 +143,9 @@ shrugging, and why the report prints both numbers when they differ.
 That 95% is measured, not estimated: the length is converged on using the
 server's own `/v1/chat/completions/input_tokens` endpoint, so it accounts for the
 chat template wrapper — exactly what tips a near-full prompt over the limit. The
-`FILLED` column reports the real prompt size that was pushed through, or
-`died@N` for the rung that killed the run.
+`FILLED` column reports the real prompt size that was pushed through,
+`died@N` for the rung that killed the run, or `timeout@N/Ss` when the prompt
+did not finish inside its budget.
 
 Only 8 tokens are requested back. The question is whether prefill survives and
 the model still speaks, not how fast it writes.
@@ -209,7 +210,7 @@ case where the prompt ladder itself is not enough.
 ctxprobe MODEL.gguf [options] [-- extra llama-server args]
 
   --min N        lower bound (default 2048)
-  --max N        upper bound (default: model's trained context, capped 131072)
+  --max N        upper bound (default: model's trained context, capped 262144)
   --step N       granularity (default 256)
   --kv TYPE      KV cache type: q8_0 (default), f16, q4_0
   --parallel N   server slots (default 1)
@@ -243,6 +244,9 @@ Extra `llama-server` flags pass through after `--`:
 
 `LLAMA_SERVER=/path/to/llama-server` overrides binary discovery.
 `CUDA_VISIBLE_DEVICES` picks the GPU (single-GPU only by design).
+`CTXPROBE_FILL_MIN_TPS` (default 150) sets the slowest prefill rate the
+full-window validation will wait for; a prompt that outlasts that budget with a
+healthy server is reported as `TIMEOUT`, not as a ceiling.
 
 Reporting the real allocatable total needs `torch` importable from some Python
 on the box (conda envs are searched automatically; `CTXPROBE_PYTHON` points at a

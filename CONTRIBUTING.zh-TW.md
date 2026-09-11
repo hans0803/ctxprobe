@@ -33,16 +33,17 @@
 
 ## JSON 格式
 
-`--json` 會往 stdout 寫一個物件，進度輸出到 stderr。Schema 3：
+`--json` 會往 stdout 寫一個物件，進度輸出到 stderr。Schema 4：
 
 | 欄位 | 型別 | 意義 |
 |---|---|---|
-| `schema` | int | 形狀改變時會遞增。目前是 **3**。 |
+| `schema` | int | 形狀改變時會遞增。目前是 **4**。 |
 | `model` | string | 傳入的 GGUF 的檔名。 |
 | `gpu` | string | `nvidia-smi` 給的名字。 |
 | `max_context` | int | **答案。** 實際跑得起來的最大 context。 |
 | `validated_at_fill` | bool | `max_context` 有沒有撐過一個灌滿視窗 `fill_percent` 的 prompt。**如果是 false，`max_context` 就是未確認的** —— 階梯放行了它，而滿視窗沒有。 |
 | `ladder_max_context` | int | 光靠 64/512/4096 階梯會回報的數字。除非滿視窗失敗、搜尋往下二分過，否則等於 `max_context` —— 那個落差會很大的唯一一種架構，見 [gotchas.zh-TW.md](docs/gotchas.zh-TW.md) 的 #11。 |
+| `fill_timed_out` | bool | 滿視窗的 prompt 超過了時間預算，而伺服器仍然健康。此時 `max_context` 是因為速度而未確認，不是記憶體 —— 調高 `-ub` 或 `CTXPROBE_FILL_MIN_TPS` 再跑一次。 |
 | `peak_vram_mib` | int\|null | 勝出那一輪在被探測的裝置上取樣到的最高用量。這**不是**餘裕的估計 —— [gotchas.zh-TW.md](docs/gotchas.zh-TW.md) #5。 |
 | `prefill_tps` | float\|null | 來自填充驗證，所以是對著已載入的視窗量的。 |
 | `generate_tps` | float\|null | 同一輪。是往接近滿的快取裡解碼，不是空的。 |
@@ -66,8 +67,9 @@ context  result  peak_vram_mib  prefill_tps  generate_tps  prompt_tokens
 它們的速度來自那一輪爬到的最後一階 —— 所以描述的是輕載的視窗，
 **不能**跟 `final:` 的數字相比。
 
-`result` 的值是 `PASS`、`LOAD_FAIL`、`DECODE_OOM`、`PREFILL_OOM`、`SILENT` 之一。
-當某一階殺死了那一輪時，`prompt_tokens` 會帶著 `died@N`，指出是哪一階。
+`result` 的值是 `PASS`、`LOAD_FAIL`、`DECODE_OOM`、`PREFILL_OOM`、`SILENT`、`TIMEOUT` 之一。
+當某一階殺死了那一輪時，`prompt_tokens` 會帶著 `died@N`，指出是哪一階；
+N 個 token 的 prompt 沒能在 S 秒預算內跑完時，則是 `timeout@N/Ss`。
 
 ## 修改腳本
 

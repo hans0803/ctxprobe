@@ -144,7 +144,7 @@ backtrace 和算式在 [gotchas.zh-TW.md](docs/gotchas.zh-TW.md) 的 #11。
 `/v1/chat/completions/input_tokens` 端點迭代逼近，所以連 chat template 的包裝都算進去了，
 而那層包裝正好就是把「接近滿」的 prompt 推過界的元兇。
 `FILLED` 欄位回報的是實際灌進去的 prompt 大小，失敗時則是 `died@N`，
-指出殺死這一輪的是哪一階。
+指出殺死這一輪的是哪一階；prompt 沒在預算內跑完則是 `timeout@N/Ss`。
 
 只要求回傳 8 個 token。要證明的是「prefill 撐得住、模型還開得了口」，
 而不是它寫得多快。
@@ -207,7 +207,7 @@ cparams.n_ctx = GGML_PAD(cparams.n_ctx, 256);
 ctxprobe MODEL.gguf [選項] [-- 額外的 llama-server 參數]
 
   --min N        搜尋下限（預設 2048）
-  --max N        搜尋上限（預設：模型的訓練 context，上限 131072）
+  --max N        搜尋上限（預設：模型的訓練 context，上限 262144）
   --step N       粒度（預設 256）
   --kv TYPE      KV cache 型別：q8_0（預設）、f16、q4_0
   --parallel N   server slot 數（預設 1）
@@ -241,6 +241,8 @@ ctxprobe MODEL.gguf [選項] [-- 額外的 llama-server 參數]
 
 `LLAMA_SERVER=/path/to/llama-server` 可覆寫 binary 的搜尋結果。
 `CUDA_VISIBLE_DEVICES` 用來選卡（設計上只處理單卡）。
+`CTXPROBE_FILL_MIN_TPS`（預設 150）是滿視窗驗證願意等待的最慢 prefill 速率；
+一個 prompt 超過那個時間預算而伺服器仍然健康，會被回報為 `TIMEOUT`，而不是天花板。
 
 要顯示真實的可配置總量，需要機器上某個 Python 能 import `torch`
 （會自動搜尋 conda envs；`CTXPROBE_PYTHON` 可以指定特定的一個）。

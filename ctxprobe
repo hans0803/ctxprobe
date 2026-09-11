@@ -17,7 +17,7 @@
 #
 # Options:
 #   --min N           lower bound for the search (default 2048)
-#   --max N           upper bound (default: model's trained context, capped 131072)
+#   --max N           upper bound (default: model's trained context, capped 262144)
 #   --step N          granularity (default 256 — llama.cpp pads n_ctx to 256)
 #   --kv TYPE         KV cache type: q8_0 (default), f16, q4_0, ...
 #   --parallel N      server slots (default 1; the default of 4 quadruples KV)
@@ -171,7 +171,7 @@ def rd_val(t):
 for _ in range(n_kv):
     k = rd_str(); (t,) = struct.unpack('<I', f.read(4)); v = rd_val(t)
     if k.endswith('.context_length'):
-        print(min(int(v), 131072)); sys.exit(0)
+        print(min(int(v), 262144)); sys.exit(0)
 sys.exit(1)
 PY
 )
@@ -269,7 +269,7 @@ for k in ("n_ctx", "default_generation_settings"):
     if isinstance(v, dict) and isinstance(v.get("n_ctx"), int): print(v["n_ctx"]); break' 2>/dev/null)
       if [[ -n "$served" ]] && (( served != ctx )); then
         cleanup
-        echo -e "LOAD_FAIL\t$peak\t\t"; return 1
+        echo "LOAD_FAIL|$peak||"; return 1
       fi
       ready=yes; break
     fi
@@ -278,7 +278,7 @@ for k in ("n_ctx", "default_generation_settings"):
 
   if [[ "$ready" != yes ]]; then
     cleanup
-    echo -e "LOAD_FAIL\t$peak\t\t"; return 1
+    echo "LOAD_FAIL|$peak||"; return 1
   fi
 
   # Short prompt: proves it decodes at all.
@@ -289,7 +289,7 @@ for k in ("n_ctx", "default_generation_settings"):
 
   if grep -qiE "CUDA error|ggml_abort|out of memory" "$log"; then
     cleanup
-    echo -e "DECODE_OOM\t$peak\t\t"; return 1
+    echo "DECODE_OOM|$peak||"; return 1
   fi
 
   # Prompt ladder. A larger prefill instantiates CUDA kernel variants a smaller
@@ -301,10 +301,18 @@ for k in ("n_ctx", "default_generation_settings"):
   # It also reports *where* it died, which one long prompt cannot.
   local ok
   ok=$(python3 - "$ctx" "$PORT" "$FILL" "$mode" <<'LADDER'
-import json, random, sys, urllib.request
+import json, os, random, socket, sys, urllib.error, urllib.request
 ctx, port, fill, mode = int(sys.argv[1]), sys.argv[2], int(sys.argv[3]), sys.argv[4]
 
 GEN = 8
+# The full-window prompt is given as long as it needs at this prefill rate, and
+# never less than 900 s. 150 tok/s is the slowest configuration this project has
+# measured (a 137 GB MoE with experts in DDR5 at the default -ub). Below that the
+# run stops with TIMEOUT rather than calling a stopwatch a memory ceiling.
+try:
+    FILL_MIN_TPS = max(1, int(os.environ.get('CTXPROBE_FILL_MIN_TPS', '150')))
+except ValueError:
+    FILL_MIN_TPS = 150
 target = max(1, int(ctx * fill / 100) - GEN)
 vocab = "alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo lima".split()
 
@@ -361,13 +369,21 @@ if mode == 'full' or not rungs:
 used = 0
 for i, rung in enumerate(rungs):
     text, n = build(rung, i)
+    tmo = max(900, rung // FILL_MIN_TPS)
     try:
         r = post("/v1/chat/completions",
-                 {"messages": [{"role": "user", "content": text}], "max_tokens": GEN})
+                 {"messages": [{"role": "user", "content": text}], "max_tokens": GEN},
+                 timeout=tmo)
         usage = r.get("usage") or {}
         used = usage.get("prompt_tokens") or n or rung
         if (usage.get("completion_tokens") or 0) == 0:
             print(f"silent {used}"); break
+    except (socket.timeout, TimeoutError):
+        print(f"timeout {n or rung} {tmo}"); break
+    except urllib.error.URLError as e:
+        if isinstance(getattr(e, "reason", None), (socket.timeout, TimeoutError)):
+            print(f"timeout {n or rung} {tmo}"); break
+        print(f"fail {n or rung}"); break   # the rung that died is the useful part
     except Exception:
         print(f"fail {n or rung}"); break   # the rung that died is the useful part
 else:
@@ -379,6 +395,9 @@ LADDER
     ok\ *)     filled="${ok#ok }" ;;
     silent\ *) filled="${ok#silent }" ;;
     fail\ *)   filled="died@${ok#fail }" ;;   # which rung killed it
+    timeout\ *)
+      read -r _tt _ts <<< "${ok#timeout }"
+      filled="timeout@${_tt}/${_ts:-?}s" ;;   # tokens sent / budget, readable in results.tsv
   esac
 
   local u; u=$(smi --query-gpu=memory.used --format=csv,noheader,nounits | head -1)
@@ -401,15 +420,22 @@ LADDER
   # a thinking model that spent the whole budget reasoning (see gotchas.md).
   # Reporting that as an OOM sends people hunting for a memory problem.
   if [[ "$ok" == silent\ * ]] && ! grep -qiE "CUDA error|ggml_abort|out of memory" "$log"; then
-    echo -e "SILENT\t$peak\t${pre:-}\t${gen:-}\t${filled:-}"; return 1
+    echo "SILENT|$peak|${pre:-}|${gen:-}|${filled:-}"; return 1
+  fi
+  # A prompt that did not finish inside the time budget, with nothing in the log,
+  # is a speed result, not a memory one. Filing it as PREFILL_OOM would turn a
+  # slow prefill into a false ceiling — and the bisection would then hunt for the
+  # size that fits the stopwatch.
+  if [[ "$ok" == timeout\ * ]] && ! grep -qiE "CUDA error|ggml_abort|out of memory" "$log"; then
+    echo "TIMEOUT|$peak|${pre:-}|${gen:-}|${filled:-}"; return 1
   fi
   # PREFILL_OOM, not LONG_OOM: the killing prompt is usually 64 tokens, not a
   # long one. Naming it after length was a leftover from believing the buffers
   # grew with prompt size, and it sent people looking in the wrong place.
   if [[ "$ok" != ok\ * ]] || grep -qiE "CUDA error|ggml_abort|out of memory" "$log"; then
-    echo -e "PREFILL_OOM\t$peak\t${pre:-}\t${gen:-}\t${filled:-}"; return 1
+    echo "PREFILL_OOM|$peak|${pre:-}|${gen:-}|${filled:-}"; return 1
   fi
-  echo -e "PASS\t$peak\t${pre:-}\t${gen:-}\t${filled:-}"; return 0
+  echo "PASS|$peak|${pre:-}|${gen:-}|${filled:-}"; return 0
 }
 
 record() { printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
@@ -458,7 +484,7 @@ if [[ -n "$LIST" ]]; then
   for c in "${_list[@]}"; do
     [[ "$c" =~ ^(0|[1-9][0-9]*)$ ]] || die "--list takes numbers, got: $c"
     c=$(round_step "$c")
-    IFS=$'\t' read -r v p pre gen fl < <(try_ctx "$c")
+    IFS='|' read -r v p pre gen fl < <(try_ctx "$c")
     emit "$c" "$v" "$p" "$pre" "$gen" "$fl"
     record "$c" "$v" "$p" "$pre" "$gen" "$fl"
     [[ "$v" == PASS ]] && (( c > BEST )) && { BEST=$c; BEST_PRE=$pre; BEST_GEN=$gen; BEST_PEAK=$p; }
@@ -466,7 +492,7 @@ if [[ -n "$LIST" ]]; then
 else
   # Binary search. lo is the largest known-good, hi the smallest known-bad.
   lo=0; hi=$(( MAX + STEP ))
-  IFS=$'\t' read -r v p pre gen fl < <(try_ctx "$MIN")
+  IFS='|' read -r v p pre gen fl < <(try_ctx "$MIN")
   emit "$MIN" "$v" "$p" "$pre" "$gen" "$fl"; record "$MIN" "$v" "$p" "$pre" "$gen" "$fl"
   if [[ "$v" != PASS ]]; then
     (( JSON == 0 )) && { echo; echo "Even the minimum ($MIN) does not run. Try a smaller quant or --kv q4_0."; }
@@ -476,7 +502,7 @@ else
   fi
   lo=$MIN; BEST=$MIN; BEST_PRE=$pre; BEST_GEN=$gen; BEST_PEAK=$p
 
-  IFS=$'\t' read -r v p pre gen fl < <(try_ctx "$MAX")
+  IFS='|' read -r v p pre gen fl < <(try_ctx "$MAX")
   emit "$MAX" "$v" "$p" "$pre" "$gen" "$fl"; record "$MAX" "$v" "$p" "$pre" "$gen" "$fl"
   if [[ "$v" == PASS ]]; then
     BEST=$MAX; BEST_PRE=$pre; BEST_GEN=$gen; BEST_PEAK=$p
@@ -487,7 +513,7 @@ else
       mid=$(( (lo + hi) / 2 )); mid=$(round_step "$mid")
       (( mid <= lo )) && break
       (( mid >= hi )) && break
-      IFS=$'\t' read -r v p pre gen fl < <(try_ctx "$mid")
+      IFS='|' read -r v p pre gen fl < <(try_ctx "$mid")
       emit "$mid" "$v" "$p" "$pre" "$gen" "$fl"; record "$mid" "$v" "$p" "$pre" "$gen" "$fl"
       if [[ "$v" == PASS ]]; then
         lo=$mid; BEST=$mid; BEST_PRE=$pre; BEST_GEN=$gen; BEST_PEAK=$p
@@ -511,15 +537,27 @@ fi
 # So the fallback is a second binary search, this time validating every probe
 # at FILL%. It is bounded by log2(range/STEP) boots, and it ends on a size
 # that actually held a full window — or on the finding that nothing did.
-VALIDATED=0; LADDER_BEST=$BEST
+VALIDATED=0; LADDER_BEST=$BEST; FILL_TIMED_OUT=0; TIMEOUT_AT=""; TIMEOUT_SECS=""
+# try_ctx runs in a subshell, so the size and budget of a timed-out probe come
+# back through its filled field (timeout@TOKENS/SECSs), not through a variable.
+note_timeout() { FILL_TIMED_OUT=1; TIMEOUT_AT=$1; TIMEOUT_SECS=${2##*/}; TIMEOUT_SECS=${TIMEOUT_SECS%s}; }
 if (( BEST > 0 )); then
   (( JSON == 0 )) && { echo; echo "Validating $BEST at ${FILL}% fill..."; }
-  IFS=$'\t' read -r v p pre gen fl < <(try_ctx "$BEST" full)
+  IFS='|' read -r v p pre gen fl < <(try_ctx "$BEST" full)
   record "$BEST" "final:$v" "$p" "$pre" "$gen" "$fl"
   (( JSON == 1 )) && printf '  validate %s: %s\n' "$BEST" "$v" >&2
   if [[ "$v" == PASS ]]; then
     BEST_PEAK=$p; BEST_PRE=$pre; BEST_GEN=$gen; VALIDATED=1
     (( JSON == 0 )) && echo "  confirmed: $BEST ($fl tokens filled)"
+  elif [[ "$v" == TIMEOUT ]]; then
+    # Not a memory verdict, so there is nothing to bisect towards: a smaller size
+    # that finishes in time would be a speed ceiling wearing a memory label.
+    note_timeout "$BEST" "$fl"
+    (( JSON == 0 )) && {
+      echo "  $BEST did not finish a ${FILL}% prompt in ${TIMEOUT_SECS:-?} s"
+      echo "  (budget assumes >= ${CTXPROBE_FILL_MIN_TPS:-150} tok/s prefill; the server was still"
+      echo "  alive and the log is clean, so this is speed, not memory). Not bisecting."
+    }
   else
     (( JSON == 0 )) && {
       echo "  $BEST failed at ${FILL}% fill ($v)"
@@ -551,12 +589,16 @@ if (( BEST > 0 )); then
       (( mid >= hi )) && break
       (( mid < STEP )) && break
       _n=$(( _n + 1 ))
-      IFS=$'\t' read -r v p pre gen fl < <(try_ctx "$mid" full)
+      IFS='|' read -r v p pre gen fl < <(try_ctx "$mid" full)
       record "$mid" "final:$v" "$p" "$pre" "$gen" "$fl"
       (( JSON == 1 )) && printf '  validate %s: %s\n' "$mid" "$v" >&2
       if [[ "$v" == PASS ]]; then
         lo=$mid; LO_OK=1; BEST_PEAK=$p; BEST_PRE=$pre; BEST_GEN=$gen
         (( JSON == 0 )) && echo "  $mid holds at ${FILL}% fill ($fl tokens filled)"
+      elif [[ "$v" == TIMEOUT ]]; then
+        note_timeout "$mid" "$fl"
+        (( JSON == 0 )) && echo "  $mid did not finish in ${TIMEOUT_SECS:-?} s — stopping; a timeout is not a memory edge"
+        break
       else
         hi=$mid
         (( JSON == 0 )) && echo "  $mid failed at ${FILL}% fill ($v)"
@@ -567,6 +609,13 @@ if (( BEST > 0 )); then
       (( JSON == 0 )) && {
         echo "  confirmed: $BEST — the ladder had said $LADDER_BEST,"
         echo "  $(( LADDER_BEST - BEST )) tokens too high"
+        (( FILL_TIMED_OUT )) && echo "  (a larger probe timed out, so the true edge may sit above $BEST)"
+      }
+    elif (( FILL_TIMED_OUT == 1 )); then
+      (( JSON == 0 )) && {
+        echo "  no size was confirmed: $LADDER_BEST failed at ${FILL}% fill and the bisection"
+        echo "  stopped at $TIMEOUT_AT on a timeout. Set CTXPROBE_FILL_MIN_TPS lower (or raise -ub)"
+        echo "  and re-run to find the edge below $LADDER_BEST."
       }
     else
       (( JSON == 0 )) && {
@@ -583,14 +632,16 @@ fi
 if (( JSON == 1 )); then
   python3 - "$MODEL" "$GPU_NAME" "$BEST" "$BEST_PEAK" "$BEST_PRE" "$BEST_GEN" \
            "$KV" "$PARALLEL" "$VRAM_TOTAL" "${VRAM_USABLE:-}" "$NGL" "$FILL" \
-           "$CUDA_LOADING" "$VRAM_BASE" "$FLASH_ATTN" "$VALIDATED" "$LADDER_BEST" <<'PY'
+           "$CUDA_LOADING" "$VRAM_BASE" "$FLASH_ATTN" "$VALIDATED" "$LADDER_BEST" \
+           "$FILL_TIMED_OUT" <<'PY'
 import json, os, sys
 (m, gpu, best, peak, pre, gen, kv, par, total, usable,
- ngl, fill, cuda_loading, free, flash_attn, validated, ladder_best) = sys.argv[1:18]
+ ngl, fill, cuda_loading, free, flash_attn, validated, ladder_best,
+ fill_timed_out) = sys.argv[1:19]
 print(json.dumps({
     # Bump when the shape of this object changes, so collected results stay
     # interpretable once several machines have contributed.
-    "schema": 3,
+    "schema": 4,
     "model": os.path.basename(m), "gpu": gpu,
     "max_context": int(best),
     # False means the search ladder cleared this size but a prompt filling
@@ -599,6 +650,9 @@ print(json.dumps({
     # What the 64/512/4096 ladder alone would have reported. Equal to
     # max_context unless a full window failed and the search bisected down.
     "ladder_max_context": int(ladder_best),
+    # True when the full-window prompt hit its time budget with the server still
+    # healthy. max_context is then unconfirmed for speed reasons, not memory.
+    "fill_timed_out": fill_timed_out == "1",
     "peak_vram_mib": int(peak) if peak else None,
     "prefill_tps": float(pre) if pre else None,
     "generate_tps": float(gen) if gen else None,
@@ -619,6 +673,19 @@ else
       echo "Largest context that actually runs: $BEST tokens"
       (( LADDER_BEST > BEST )) && \
       echo "  the ladder cleared $LADDER_BEST; only a ${FILL}% prompt found the real edge"
+      (( FILL_TIMED_OUT )) && \
+      echo "  a larger probe timed out (>= ${CTXPROBE_FILL_MIN_TPS:-150} tok/s assumed); the edge may be higher"
+    elif (( FILL_TIMED_OUT == 1 )); then
+      echo "Largest context that cleared the ladder: $BEST tokens (UNCONFIRMED — timed out)"
+      if [[ "$TIMEOUT_AT" == "$BEST" ]]; then
+        echo "  a prompt filling ${FILL}% of the window did not finish in ${TIMEOUT_SECS:-?} s."
+      else
+        echo "  it failed at ${FILL}% fill, and the bisection below it stopped when"
+        echo "  $TIMEOUT_AT did not finish in ${TIMEOUT_SECS:-?} s."
+      fi
+      echo "  That budget assumes >= ${CTXPROBE_FILL_MIN_TPS:-150} tok/s of prefill. This is not a"
+      echo "  memory result: raise -ub (see docs/gotchas.md #7) or set"
+      echo "  CTXPROBE_FILL_MIN_TPS lower to wait longer, then re-run."
     else
       echo "Largest context that cleared the ladder: $BEST tokens (UNCONFIRMED)"
       echo "  it did not survive a prompt filling ${FILL}% of the window"
@@ -653,6 +720,8 @@ else
   echo "DECODE_OOM   loaded, then died on the 18-token warm-up prompt"
   echo "PREFILL_OOM  died on a ladder rung; FILLED says which one. Usually 64"
   echo "             tokens, not a long prompt — see docs/gotchas.md"
+  echo "TIMEOUT      the full-window prompt did not finish inside its time budget"
+  echo "             and the server is fine — a speed result, never a memory one"
   echo "SILENT       ran without crashing but produced no tokens; usually a"
   echo "             thinking model spending its budget on reasoning, not memory"
   echo
